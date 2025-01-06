@@ -47,8 +47,8 @@ const CpuPressure = struct {
     const full_avg300 = try splitTillSkip(&data, string_total);
     const full_total  = try splitTillSkip(&data, "\n");
 
-    std.debug.print("some_avg10 = `{s}`, some_avg60 = `{s}`, some_avg300 = `{s}`. some_total = `{s}`\n", .{some_avg10, some_avg60, some_avg300, some_total});
-    std.debug.print("full_avg10 = `{s}`, full_avg60 = `{s}`, full_avg300 = `{s}`. full_total = `{s}`\n", .{full_avg10, full_avg60, full_avg300, full_total});
+    // std.debug.print("some_avg10 = `{s}`, some_avg60 = `{s}`, some_avg300 = `{s}`. some_total = `{s}`\n", .{some_avg10, some_avg60, some_avg300, some_total});
+    // std.debug.print("full_avg10 = `{s}`, full_avg60 = `{s}`, full_avg300 = `{s}`. full_total = `{s}`\n", .{full_avg10, full_avg60, full_avg300, full_total});
 
     const retval: @This() = .{
       .some = .{
@@ -65,7 +65,7 @@ const CpuPressure = struct {
       },
     };
 
-    std.debug.print("{}\n", .{ retval });
+    // std.debug.print("{}\n", .{ retval });
     return retval;
   }
 
@@ -149,6 +149,7 @@ const Cpu = struct {
   const CpuFreq = struct{};
 
   pub const DataError = error {
+    NoData,
     UnexpectedData,
     UnexpectedDataLength,
   };
@@ -170,8 +171,15 @@ const Cpu = struct {
       const online_file = try online_file_with_error;
       defer online_file.close();
 
-      var output: [2]u8 = undefined; // 2 because we wanna error if file contains more/less than 1 character
-      if (try online_file.readAll(&output) != 1) return InitError.UnexpectedDataLength;
+      var output: [3]u8 = undefined; // 2 because we wanna error if file contains more/less than 1 character
+      switch (try online_file.readAll(&output)) {
+        0 => return InitError.NoData,
+        1 => {}, // Unexpected but ok
+        2 => { // expected
+          if (output[1] != '\n') return InitError.UnexpectedData;
+        },
+        else => return InitError.UnexpectedDataLength,
+      }
 
       const online_file_path = try std.fs.path.join(allocator, &[_][]const u8{dir, "online"});
       errdefer allocator.free(online_file_path);
@@ -232,8 +240,15 @@ const Cpu = struct {
       const online_file = try std.fs.cwd().openFile(online_file_name, .{});
       defer online_file.close();
 
-      var output: [2]u8 = undefined; // 2 because we wanna error if file contains more/less than 1 character
-      if (try online_file.readAll(&output) != 1) return InitError.UnexpectedDataLength;
+      var output: [3]u8 = undefined; // 2 because we wanna error if file contains more/less than 1 character
+      switch (try online_file.readAll(&output)) {
+        0 => return InitError.NoData,
+        1 => {}, // Unexpected but ok
+        2 => { // expected
+          if (output[1] != '\n') return InitError.UnexpectedData;
+        },
+        else => return InitError.UnexpectedDataLength,
+      }
 
       self.online_now = switch(output[0]) {
         '0' => false,
@@ -276,10 +291,9 @@ const AllCpus = struct {
 
     var iterator = cpus_dir.iterate();
     while (try iterator.next()) |entry| {
-      if (entry.name.len < 3 or entry.name[0..3] != ("cpu")[0..3]) continue;
-      const remaining_name = entry.name[3..];
+      if (entry.name.len < 4 or @as(u24, @bitCast(entry.name[0..3].*)) != @as(u24, @bitCast([3]u8{'c', 'p', 'u'}))) continue;
       const is_numeric = blk: {
-        for (remaining_name) |char| {
+        for (entry.name[3..]) |char| {
           if (char < '0' or '9' < char) break :blk false;
         }
         break :blk true;
@@ -351,11 +365,7 @@ const AllCpus = struct {
     } else if (newPressure.some.avg10 > 30) {
       std.debug.print("Wake 1\n", .{});
       try self.wakeOne();
-    } else if (newPressure.some.avg10 < 0.1) {
-      std.debug.print("Sleep 2\n", .{});
-      try self.sleepOne();
-      try self.sleepOne();
-    } else if (newPressure.some.avg10 < 5) {
+    } else if (newPressure.some.avg10 < 2) {
       std.debug.print("Sleep 1\n", .{});
       try self.sleepOne();
     }
@@ -376,7 +386,6 @@ const AllCpus = struct {
   }
 };
 
-
 pub fn main() !void {
   var gpa = std.heap.GeneralPurposeAllocator(.{}){};
   defer {
@@ -394,20 +403,9 @@ pub fn main() !void {
     all.adjustSleepingCpus() catch |e| {
       std.debug.print("An Error occurred {!}\n", .{ e });
     };
-    std.time.sleep(1 * std.time.ns_per_s);
+    std.time.sleep(10 * std.time.ns_per_s);
   }
 }
-
-// var stdout_buffer: std.io.BufferedWriter(1 << 12, std.fs.File.Writer) = undefined;
-//
-// fn init() void {
-//   const stdout_file = std.io.getStdOut().writer();
-//   stdout_buffer = std.io.bufferedWriter(stdout_file);
-//   stdout = stdout_buffer.writer();
-// }
-//
-// var stdout: @TypeOf(stdout_buffer).Writer = undefined;
-// // var allocator: std.mem.Allocator = undefined;
 
 test {
   std.testing.refAllDeclsRecursive(@This());
