@@ -1,3 +1,8 @@
+// TODOS's:
+//    Wakeup using poll() instead of busy loop
+//    deal with oom killer https://gist.github.com/t27/ad5219a7cdb7bcb977deccbc48a480d5
+//    register a handler even if we are unexpectedly killed, and restore the original state in this case
+//    make cpu strucct more efficient
 const std = @import("std");
 const builtin = @import("builtin");
 
@@ -9,9 +14,11 @@ const LoggingLevelEnum = enum {
   Error,
 };
 
+// This is to read cpu pressure
+// For more info see https://docs.kernel.org/accounting/psi.html
+// NOTE: support for full pressure is dropped since kernel version 5.13
 const CpuPressure = struct {
   some: CpuPressureResultType,
-  full: CpuPressureResultType,
 
   pub const CpuPressureResultType = struct {
     avg10: f32,
@@ -27,6 +34,7 @@ const CpuPressure = struct {
   } || std.fmt.ParseFloatError || std.fmt.ParseIntError;
 
   pub fn fromString(immutable_data: []const u8) ParseError!@This() {
+    // TODO: Parsing can be made slightly faster by using the fact that float format is of form xxx.xx / xx.xx / x.xx
     const string_prefix = "xxxx avg10=";
     // Preceding space is intentional
     const string_avg60 = " avg60=";
@@ -40,15 +48,9 @@ const CpuPressure = struct {
     const some_avg10  = try splitTillSkip(&data, string_avg60);
     const some_avg60  = try splitTillSkip(&data, string_avg300);
     const some_avg300 = try splitTillSkip(&data, string_total);
-    const some_total  = try splitTillSkip(&data, "\nfull avg10=");
-
-    const full_avg10  = try splitTillSkip(&data, string_avg60);
-    const full_avg60  = try splitTillSkip(&data, string_avg300);
-    const full_avg300 = try splitTillSkip(&data, string_total);
-    const full_total  = try splitTillSkip(&data, "\n");
+    const some_total  = try splitTillSkip(&data, "\n");
 
     // std.debug.print("some_avg10 = `{s}`, some_avg60 = `{s}`, some_avg300 = `{s}`. some_total = `{s}`\n", .{some_avg10, some_avg60, some_avg300, some_total});
-    // std.debug.print("full_avg10 = `{s}`, full_avg60 = `{s}`, full_avg300 = `{s}`. full_total = `{s}`\n", .{full_avg10, full_avg60, full_avg300, full_total});
 
     const retval: @This() = .{
       .some = .{
@@ -56,12 +58,6 @@ const CpuPressure = struct {
         .avg60  = try std.fmt.parseFloat(f32, some_avg60),
         .avg300 = try std.fmt.parseFloat(f32, some_avg300),
         .total  = try std.fmt.parseInt(u64, some_total, 10),
-      },
-      .full = .{
-        .avg10  = try std.fmt.parseFloat(f32, full_avg10),
-        .avg60  = try std.fmt.parseFloat(f32, full_avg60),
-        .avg300 = try std.fmt.parseFloat(f32, full_avg300),
-        .total  = try std.fmt.parseInt(u64, full_total, 10),
       },
     };
 
@@ -95,31 +91,34 @@ const CpuPressure = struct {
 };
 
 test CpuPressure {
-  const string_to_parse = (
+  // Note: even though support for `full` is dropped, it still exists in the file
+  const strings_to_parse = [_][]const u8{(
     \\some avg10=1.11 avg60=2.22 avg300=3.33 total=123
-    \\full avg10=4.44 avg60=5.55 avg300=6.66 total=456
+    \\full avg10=0.00 avg60=0.00 avg300=0.00 total=0
     \\
-  );
+  ), (
+    \\some avg10=1.11 avg60=2.22 avg300=3.33 total=123
+    \\
+  // ), (
+  //   \\some avg10=1.11 avg60=2.22 avg300=3.33 total=123
+  )};
 
-  try std.testing.expectEqual(
-    CpuPressure{
-      .some = .{
-        .avg10 = 1.11,
-        .avg60 = 2.22,
-        .avg300 = 3.33,
-        .total = 123,
+  inline for (strings_to_parse) |s| {
+    try std.testing.expectEqual(
+      CpuPressure{
+        .some = .{
+          .avg10 = 1.11,
+          .avg60 = 2.22,
+          .avg300 = 3.33,
+          .total = 123,
+        },
       },
-      .full = .{
-        .avg10 = 4.44,
-        .avg60 = 5.55,
-        .avg300 = 6.66,
-        .total = 456,
-      }
-    },
-    try CpuPressure.fromString(string_to_parse),
-  );
+      try CpuPressure.fromString(s),
+    );
+  }
 }
 
+// The cpu states
 const Cpu = struct {
   dir_name: []const u8,
   // Trur if online file exists (if this cpu can be offlined)
@@ -240,7 +239,6 @@ const AllCpus = struct {
 
   const cpus_dir_name = "/sys/devices/system/cpu/";
 
-
   // std.fs.Dir.IteratorError is not marked pub !!
   const IteratorError = error{
       AccessDenied,
@@ -327,11 +325,7 @@ const AllCpus = struct {
   pub const AdjustSleepingCpusError = Cpu.SetOnlineError || CpuPressure.ReadCpuPressureError;
   pub fn adjustSleepingCpus(self: *@This()) AdjustSleepingCpusError!void {
     const newPressure = try CpuPressure.readCpuPressure();
-    if (newPressure.full.avg10 > 15) {
-      std.debug.print("Wake 2\n", .{});
-      try self.wakeOne();
-      try self.wakeOne();
-    } else if (newPressure.some.avg10 > 30) {
+    if (newPressure.some.avg10 > 30) {
       std.debug.print("Wake 1\n", .{});
       try self.wakeOne();
     } else if (newPressure.some.avg10 < 2) {
@@ -368,6 +362,7 @@ pub fn main() !void {
   var all: AllCpus = try AllCpus.init(allocator);
   defer all.deinit(allocator);
 
+  // TODO: wakeup using poll() instead of doing a busy loop
   while (true) {
     all.adjustSleepingCpus() catch |e| {
       std.debug.print("An Error occurred {!}\n", .{ e });
