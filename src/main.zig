@@ -120,21 +120,6 @@ test CpuPressure {
   );
 }
 
-const DebugBool = struct {
-  state: if (builtin.mode == .Debug) bool else void = if (builtin.mode == .Debug) false else .{},
-
-  pub fn set(self: *@This()) void {
-    if (builtin.mode == .Debug) {
-      self.state = true;
-    }
-  }
-  pub fn unset(self: *@This()) void {
-    if (builtin.mode == .Debug) {
-      self.state = false;
-    }
-  }
-};
-
 const Cpu = struct {
   dir_name: []const u8,
   // Trur if online file exists (if this cpu can be offlined)
@@ -142,8 +127,6 @@ const Cpu = struct {
   online_now: bool,
 
   cpufreq: CpuFreq = .{},
-
-  freed: DebugBool = .{},
 
   // TODO: Maybe implement this
   const CpuFreq = struct{};
@@ -197,9 +180,6 @@ const Cpu = struct {
   }
 
   pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
-    std.debug.assert(self.freed.state == false);
-    defer self.freed.set();
-
     if (self.online_file_name) |name| {
       allocator.free(name);
     } else {
@@ -210,9 +190,6 @@ const Cpu = struct {
   pub const SetOnlineError = std.fs.File.WriteError || std.fs.File.OpenError;
 
   pub fn setOnlineUnchecked(self: *@This(), online: bool) SetOnlineError!void {
-    std.debug.assert(self.freed.state == false);
-    std.debug.assert(self.online_file_name != null);
-
     var online_file = try std.fs.cwd().openFile(self.online_file_name.?, .{.mode = .write_only});
     defer online_file.close();
     if (online) {
@@ -226,9 +203,6 @@ const Cpu = struct {
   }
 
   pub fn setOnline(self: *@This(), online: bool) SetOnlineError!void {
-    std.debug.assert(self.freed.state == false);
-    std.debug.assert(self.online_file_name != null);
-
     if (self.online_now == online) return;
     return self.setOnlineUnchecked(online);
   }
@@ -263,8 +237,6 @@ const AllCpus = struct {
   cpu_list: []Cpu,
   sleeping_list: std.ArrayListUnmanaged(*Cpu),
   sleepable_list: std.ArrayListUnmanaged(*Cpu),
-
-  freed: DebugBool = .{},
 
   const cpus_dir_name = "/sys/devices/system/cpu/";
 
@@ -339,9 +311,6 @@ const AllCpus = struct {
   }
 
   pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
-    std.debug.assert(self.freed.state == false);
-    self.freed.set();
-
     self.sleeping_list.deinit(allocator);
     self.sleepable_list.deinit(allocator);
 
