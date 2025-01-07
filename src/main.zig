@@ -1,29 +1,70 @@
+// Build Cmd: zig build-exe main.zig -OReleaseFast -fstrip -fsingle-threaded -fincremental -flto -mno-red-zone
 // TODOS's:
 //    Wakeup using poll() instead of busy loop
 //    deal with oom killer https://gist.github.com/t27/ad5219a7cdb7bcb977deccbc48a480d5
 //    register a handler even if we are unexpectedly killed, and restore the original state in this case
-//    make cpu strucct more efficient
+//    make cpu struct more efficient
 const std = @import("std");
 const builtin = @import("builtin");
 
-const LoggingLevelEnum = enum {
-  Verbose,
-  Debug,
-  Info,
-  Warn,
-  Error,
+const LoggingLevelEnum = enum(u4) {
+  err = 0,
+  warn = 1,
+  info = 2,
+  debug = 3,
+  verbose = 4,
+
+  fn string(self: @This()) []const u8 {
+    return switch (self) {
+      .@"error" => "error",
+      .warn => "warn",
+      inline else => |s| @tagName(s),
+    };
+  }
+};
+
+fn ScopedLogger(comptime scope: @TypeOf(.enum_literal)) type {
+  return struct {
+    // Till which level to log
+    level: LoggingLevelEnum = .debug,
+
+    pub fn init(level: LoggingLevelEnum) @This() {
+      return .{
+        .level = level,
+      };
+    }
+
+    pub fn log(self: @This(), comptime level: LoggingLevelEnum, comptime format: []const u8, args: anytype) void {
+      if (@intFromEnum(level) > @intFromEnum(self.level)) return;
+      const destination = switch (level) {
+        .@"error", .warning => std.io.getStdErr().writer(),
+        else => std.io.getStdOut().writer(),
+      };
+      var buffered = std.io.bufferedWriter(destination);
+      nosuspend {
+        buffered.print(level.string() ++ (if (scope == .default) ": " else "(" ++ @tagName(scope) ++ "): ") ++ format ++ "\n", args) catch {};
+        buffered.flush() catch {};
+      }
+    }
+  };
+}
+
+var global_logging_level: LoggingLevelEnum = switch (std.builtin.mode) {
+  .Debug => .debug,
+  .ReleaseSafe => .warn,
+  .ReleaseFast, .ReleaseSmall => .info,
 };
 
 // This is to read cpu pressure
 // For more info see https://docs.kernel.org/accounting/psi.html
-// NOTE: support for full pressure is dropped since kernel version 5.13
+// NOTE: `full` pressure is reported (as 0) since kernel version 5.13 but actually is undefined in case of CPU
 const CpuPressure = struct {
   some: CpuPressureResultType,
 
   pub const CpuPressureResultType = struct {
-    avg10: f32,
-    avg60: f32,
-    avg300: f32,
+    avg10: u16,
+    avg60: u16,
+    avg300: u16,
     total: u64,
   };
 
@@ -31,10 +72,10 @@ const CpuPressure = struct {
     UnexpectedEndOfString,
     WhitespaceNotFount,
     NewlineNotFound,
+    InvalidFloatFormat,
   } || std.fmt.ParseFloatError || std.fmt.ParseIntError;
 
   pub fn fromString(immutable_data: []const u8) ParseError!@This() {
-    // TODO: Parsing can be made slightly faster by using the fact that float format is of form xxx.xx / xx.xx / x.xx
     const string_prefix = "xxxx avg10=";
     // Preceding space is intentional
     const string_avg60 = " avg60=";
@@ -45,40 +86,69 @@ const CpuPressure = struct {
     std.debug.assert(std.mem.eql(u8, "some avg10=", immutable_data[0..string_prefix.len]));
 
     data = data[string_prefix.len..];
-    const some_avg10  = try splitTillSkip(&data, string_avg60);
-    const some_avg60  = try splitTillSkip(&data, string_avg300);
-    const some_avg300 = try splitTillSkip(&data, string_total);
-    const some_total  = try splitTillSkip(&data, "\n");
-
-    // std.debug.print("some_avg10 = `{s}`, some_avg60 = `{s}`, some_avg300 = `{s}`. some_total = `{s}`\n", .{some_avg10, some_avg60, some_avg300, some_total});
+    const some_avg10 = try parseFloatSkip(&data, string_avg60);
+    const some_avg60 = try parseFloatSkip(&data, string_avg300);
+    const some_avg300 = try parseFloatSkip(&data, string_total);
+    const some_total_idx = std.mem.indexOfScalar(u8, data, '\n') orelse return ParseError.UnexpectedEndOfString;
+    const some_total = data[0..some_total_idx];
 
     const retval: @This() = .{
       .some = .{
-        .avg10  = try std.fmt.parseFloat(f32, some_avg10),
-        .avg60  = try std.fmt.parseFloat(f32, some_avg60),
-        .avg300 = try std.fmt.parseFloat(f32, some_avg300),
-        .total  = try std.fmt.parseInt(u64, some_total, 10),
+        .avg10 = some_avg10,
+        .avg60 = some_avg60,
+        .avg300 = some_avg300,
+        .total = try std.fmt.parseInt(u64, some_total, 10),
       },
     };
 
-    // std.debug.print("{}\n", .{ retval });
     return retval;
   }
 
-  fn splitTillSkip(data_ptr: *[]const u8, comptime to_skip: anytype) ![]const u8 {
+  fn assertNumeric(char: u8) ParseError!void {
+    if (char < '0' or '9' < char) return ParseError.InvalidFloatFormat;
+  }
+
+  fn parseFloatSkip(data_ptr: *[]const u8, comptime to_skip: anytype) !u16 {
+    const data = data_ptr.*;
+    if (data.len < 4 + to_skip.len) return ParseError.UnexpectedEndOfString;
     const scalar = to_skip[0];
-    const ind = std.mem.indexOfScalar(u8, data_ptr.*, scalar) orelse return switch (scalar) {
+    const scalar_error = switch (scalar) {
       ' ' => ParseError.WhitespaceNotFount,
       '\n' => ParseError.NewlineNotFound,
       else => unreachable,
     };
 
-    // std.debug.assert(std.meta.eql(data_ptr.*[ind..][0..to_skip.len], to_skip));
-    std.testing.expectEqualStrings(data_ptr.*[ind..][0..to_skip.len], to_skip) catch unreachable;
+    try assertNumeric(data[0]);
+    if (data[1] == '.') {
+      // Length assertion already done
+      try assertNumeric(data[2]);
+      try assertNumeric(data[3]);
 
-    const retval = data_ptr.*[0..ind];
-    data_ptr.* = data_ptr.*[ind+to_skip.len..];
-    return retval;
+      if (data[4] != to_skip[0]) return scalar_error;
+      data_ptr.* = data[4 + to_skip.len..];
+
+      return 100 * @as(u16, data[0] - '0') + 10 * @as(u16, data[2] - '0') + @as(u16, data[3] - '0');
+    } else if (data[2] == '.') {
+      if (data.len < 5 + to_skip.len) return ParseError.UnexpectedEndOfString;
+      try assertNumeric(data[1]);
+      try assertNumeric(data[3]);
+      try assertNumeric(data[4]);
+
+      if (data[5] != to_skip[0]) return scalar_error;
+      data_ptr.* = data[5 + to_skip.len..];
+
+      return 1000 * @as(u16, data[0] - '0') + 100 * @as(u16, data[1] - '0') + 10 * @as(u16, data[3] - '0') + @as(u16, data[4] - '0');
+    } else if (data[3] == '.') {
+      if (data.len < 6 + to_skip.len) return ParseError.UnexpectedEndOfString;
+      if (@as(u48, @bitCast(data[0..6].*)) != @as(u48, @bitCast([_]u8{'1', '0', '0', '.', '0', '0'}))) return ParseError.InvalidFloatFormat;
+
+      if (data[6] != to_skip[0]) return scalar_error;
+      data_ptr.* = data[6 + to_skip.len..];
+
+      return 100_00;
+    } else {
+      return ParseError.InvalidFloatFormat;
+    }
   }
 
   pub const ReadCpuPressureError = ParseError || std.fs.File.ReadError || std.fs.File.OpenError;
@@ -107,15 +177,22 @@ test CpuPressure {
     try std.testing.expectEqual(
       CpuPressure{
         .some = .{
-          .avg10 = 1.11,
-          .avg60 = 2.22,
-          .avg300 = 3.33,
+          .avg10 = 111,
+          .avg60 = 222,
+          .avg300 = 333,
           .total = 123,
         },
       },
       try CpuPressure.fromString(s),
     );
   }
+}
+
+pub const SetOomUnkillableError = std.fs.File.OpenError || std.fs.File.WriteError;
+fn setOomUnkillable() SetOomUnkillableError!void {
+  var file = try std.fs.cwd().openFile("/proc/self/oom_score_adj", .{ .mode = .write_only });
+  defer file.close();
+  try file.writeAll("-1000\n");
 }
 
 // The cpu states
@@ -137,10 +214,11 @@ const Cpu = struct {
   };
 
   pub const InitError = DataError || std.fs.File.OpenError || std.fs.File.ReadError || std.mem.Allocator.Error;
+  const string_online = "online";
 
   pub fn init(allocator: std.mem.Allocator, dir: []const u8, cpu_dir: std.fs.Dir) InitError!@This() {
     var self: @This() = undefined;
-    const online_file_with_error = cpu_dir.openFile("online", .{});
+    const online_file_with_error = cpu_dir.openFile(string_online, .{});
 
     if (online_file_with_error == error.FileNotFound) {
       self.dir_name = try allocator.dupe(u8, dir);
@@ -163,7 +241,7 @@ const Cpu = struct {
         else => return InitError.UnexpectedDataLength,
       }
 
-      const online_file_path = try std.fs.path.join(allocator, &[_][]const u8{dir, "online"});
+      const online_file_path = try std.fs.path.join(allocator, &[_][]const u8{dir, string_online});
       errdefer allocator.free(online_file_path);
 
       self.dir_name = online_file_path[0..dir.len];
