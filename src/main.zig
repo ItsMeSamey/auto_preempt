@@ -1,7 +1,6 @@
 // Build Cmd: zig build-exe main.zig -OReleaseFast -fstrip -fsingle-threaded -fincremental -flto -mno-red-zone
 // TODOS's:
 //    Wakeup using poll() instead of busy loop
-//    deal with oom killer https://gist.github.com/t27/ad5219a7cdb7bcb977deccbc48a480d5
 //    register a handler even if we are unexpectedly killed, and restore the original state in this case
 const std = @import("std");
 const builtin = @import("builtin");
@@ -64,7 +63,7 @@ const CpuPressure = struct {
     WhitespaceNotFount,
     NewlineNotFound,
     InvalidFloatFormat,
-  } || std.fmt.ParseFloatError || std.fmt.ParseIntError;
+  } || std.fmt.ParseIntError;
 
   pub fn fromString(immutable_data: []const u8) ParseError!@This() {
     const string_prefix = "xxxx avg10=";
@@ -100,7 +99,7 @@ const CpuPressure = struct {
     if (char < '0' or '9' < char) return ParseError.InvalidFloatFormat;
   }
 
-  fn parseFloatSkip(data_ptr: *[]const u8, comptime to_skip: anytype) !u16 {
+  fn parseFloatSkip(data_ptr: *[]const u8, comptime to_skip: anytype) ParseError!u16 {
     const data = data_ptr.*;
     if (data.len < 4 + to_skip.len) return ParseError.UnexpectedEndOfString;
     const scalar = to_skip[0];
@@ -150,6 +149,50 @@ const CpuPressure = struct {
     const read_result = try std.fs.cwd().readFile("/proc/pressure/cpu", &buf);
     return @This().fromString(read_result);
   }
+
+  pub const SubscribeError = error {
+    FileOpenError,
+    WriteError,
+  };
+  // Time limit for window_us is 500ms to 10s
+  pub fn subscribe(stall_limit_us: u32, window_us: u32) SubscribeError!std.os.linux.pollfd {
+    std.debug.assert(window_us > 500_000);
+    std.debug.assert(window_us < 10_00_000);
+    std.debug.assert(stall_limit_us < window_us);
+
+    const fd_usize = try std.os.linux.open("/proc/pressure/cpu/cpu0/cpufreq/stats", std.os.linux.O{ .ACCMODE = .RDWR, .NONBLOCK = true}, 0);
+    const fd = @as(std.os.linux.fd_t, @bitCast(@as(std.meta.Int(.unsigned, @sizeOf(std.os.linux.fd_t)), @truncate(fd_usize))));
+    if (fd < 0) return SubscribeError.FileOpenError;
+    var retval: std.os.linux.pollfd = undefined;
+    retval.fd = fd;
+    retval.events = std.os.linux.POLL.PRI;
+    retval.revents = 0;
+    errdefer closeSubscription(retval);
+
+    var buf: [6 + 10 + 10 + 1]u8 = undefined; // 6 for ("some " & " "), 10 for stall_limit_us, 10 for window_us + 1 for '\x00'
+    const count = std.io.fixedBufferStream(@as([]u8, &buf)).writer().print("some {d} {d}\x00", .{stall_limit_us, window_us}) catch unreachable;
+    const write_usize = try std.os.linux.write(fd, &buf, count);
+    const write_result = @as(c_int, @bitCast(@as(std.meta.Int(.unsigned, @sizeOf(c_int)), @truncate(write_usize))));
+    if (write_result < 0) return SubscribeError.WriteError;
+
+    return retval;
+  }
+
+  pub fn closeSubscription(fd: std.os.linux.fd_t) void {
+    std.os.linux.close(fd);
+  }
+
+  // can provide a slice or a single item pointer to pollfd struct(s)
+  // timeout_ms is in microseconds, 0 means immediate return, negative means infinite wait
+  const PollError = error { PollError };
+  pub fn waitForPressure(pollfds: anytype, timeout_ms: i32) PollError!void {
+    comptime std.debug.assert(@TypeOf(pollfds) == *std.os.linux.pollfd or @TypeOf(pollfds) == []std.os.linux.pollfd);
+    const len: usize = if (@TypeOf(pollfds) == *std.os.linux.pollfd) 1 else pollfds.len;
+    const ptr: [*]std.os.linux.pollfd = if (@TypeOf(pollfds) == *std.os.linux.pollfd) pollfds else pollfds.ptr;
+    const result_usize = std.os.linux.poll(ptr, len, timeout_ms);
+    const result = @as(c_int, @bitCast(@as(std.meta.Int(.unsigned, @sizeOf(c_int)), @truncate(result_usize))));
+    if (result < 0) return PollError.PollError;
+  }
 };
 
 test CpuPressure {
@@ -178,18 +221,11 @@ test CpuPressure {
   }
 }
 
-pub const SetOomUnkillableError = std.fs.File.OpenError || std.fs.File.WriteError;
-fn setOomUnkillable() SetOomUnkillableError!void {
-  var file = try std.fs.cwd().openFile("/proc/self/oom_score_adj", .{ .mode = .write_only });
-  defer file.close();
-  try file.writeAll("-1000\n");
-}
-
 // The cpu states
 const Cpu = struct {
-  // Trur if online file exists (if this cpu can be offlined)
-  online_file_name: ?[]const u8,
+  online_file_name: ?[*:0]const u8,
   online_now: bool,
+  initital_state: bool,
 
   pub const DataError = error {
     NoData,
@@ -197,16 +233,19 @@ const Cpu = struct {
     UnexpectedDataLength,
   };
 
-  pub const InitError = DataError || std.fs.File.OpenError || std.fs.File.ReadError || std.mem.Allocator.Error;
+  pub const InitError = DataError || std.fs.Dir.OpenError || std.fs.File.OpenError || std.fs.File.ReadError || std.mem.Allocator.Error;
   const string_online = "online";
 
-  pub fn init(allocator: std.mem.Allocator, dir: []const u8, cpu_dir: std.fs.Dir) InitError!@This() {
+  pub fn init(allocator: std.mem.Allocator, dir: []const u8) InitError!@This() {
+    var cpu_dir = try std.fs.cwd().openDir(dir, .{});
+    defer cpu_dir.close();
+
     var self: @This() = undefined;
     const online_file_with_error = cpu_dir.openFile(string_online, .{});
 
     if (online_file_with_error == error.FileNotFound) {
       self.online_file_name = null;
-      // TODO: Figure out if this needs to be changed
+      // Cpu can't be offlined (maybe??: https://www.kernel.org/doc/Documentation/ABI/testing/sysfs-devices-system-cpu)
       self.online_now = true;
     } else {
       const online_file = try online_file_with_error;
@@ -224,10 +263,10 @@ const Cpu = struct {
         else => return InitError.UnexpectedDataLength,
       }
 
-      const online_file_path = try std.fs.path.join(allocator, &[_][]const u8{dir, string_online});
+      const online_file_path = try std.fs.path.joinZ(allocator, &[_][]const u8{dir, string_online});
       errdefer allocator.free(online_file_path);
 
-      self.online_file_name = online_file_path;
+      self.online_file_name = online_file_path.ptr;
       self.online_now = switch(output[0]) {
         '0' => false,
         '1' => true,
@@ -235,29 +274,25 @@ const Cpu = struct {
       };
     }
 
+    self.initital_state = self.online_now;
     return self;
   }
 
   pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
     if (self.online_file_name) |name| {
-      allocator.free(name);
-    } else {
-      allocator.free(self.dir_name);
+      allocator.free(std.mem.sliceTo(name, '\x00'));
     }
   }
 
   pub const SetOnlineError = std.fs.File.WriteError || std.fs.File.OpenError;
 
   pub fn setOnlineUnchecked(self: *@This(), online: bool) SetOnlineError!void {
-    var online_file = try std.fs.cwd().openFile(self.online_file_name.?, .{.mode = .write_only});
+    var online_file = try std.fs.cwd().openFileZ(self.online_file_name.?, .{.mode = .write_only});
     defer online_file.close();
     if (online) {
       try online_file.writeAll(&[_]u8{'1'});
     } else {
       try online_file.writeAll(&[_]u8{'0'});
-    }
-
-    if (builtin.mode == .Debug) {
     }
   }
 
@@ -338,10 +373,7 @@ const AllCpus = struct {
       const this_cpu_dir_name = try std.fs.path.join(allocator, &[_][]const u8{cpus_dir_name, entry.name});
       defer allocator.free(this_cpu_dir_name);
 
-      var this_cpu_dir = try cpus_dir.openDir(entry.name, .{});
-      defer this_cpu_dir.close();
-
-      const cpu = try Cpu.init(allocator, this_cpu_dir_name, this_cpu_dir);
+      const cpu = try Cpu.init(allocator, this_cpu_dir_name);
 
       if (cpu.online_file_name == null) {
         ScopedLogger(.cpu_list).log(.info, "Setting status of {s} is not supported", .{entry.name});
@@ -422,12 +454,21 @@ const AllCpus = struct {
   }
 };
 
+pub const MakeOomUnkillableError = std.fs.File.OpenError || std.fs.File.WriteError;
+fn makeOomUnkillable() MakeOomUnkillableError!void {
+  var file = try std.fs.cwd().openFileZ("/proc/self/oom_score_adj", .{ .mode = .write_only });
+  defer file.close();
+  try file.writeAll("-1000\n");
+}
+
 pub fn main() !void {
+  try makeOomUnkillable();
+
   var gpa = std.heap.GeneralPurposeAllocator(.{}){};
   defer {
     const leaks = gpa.deinit();
     if (leaks == .leak) {
-      @panic("A memory leak detected");
+      @panic("Memory leak detected");
     }
   }
   const allocator = gpa.allocator();
@@ -435,7 +476,6 @@ pub fn main() !void {
   var all: AllCpus = try AllCpus.init(allocator);
   defer all.deinit(allocator);
 
-  // TODO: wakeup using poll() instead of doing a busy loop
   while (true) {
     all.adjustSleepingCpus() catch |e| {
       std.debug.print("An Error occurred {!}\n", .{ e });
