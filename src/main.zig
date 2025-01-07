@@ -3,7 +3,6 @@
 //    Wakeup using poll() instead of busy loop
 //    deal with oom killer https://gist.github.com/t27/ad5219a7cdb7bcb977deccbc48a480d5
 //    register a handler even if we are unexpectedly killed, and restore the original state in this case
-//    make cpu struct more efficient
 const std = @import("std");
 const builtin = @import("builtin");
 
@@ -16,7 +15,7 @@ const LoggingLevelEnum = enum(u4) {
 
   fn string(self: @This()) []const u8 {
     return switch (self) {
-      .@"error" => "error",
+      .err => "error",
       .warn => "warn",
       inline else => |s| @tagName(s),
     };
@@ -25,34 +24,26 @@ const LoggingLevelEnum = enum(u4) {
 
 fn ScopedLogger(comptime scope: @TypeOf(.enum_literal)) type {
   return struct {
-    // Till which level to log
-    level: LoggingLevelEnum = .debug,
+    pub fn log(comptime level: LoggingLevelEnum, comptime format: []const u8, args: anytype) void {
+      if (@intFromEnum(level) > @intFromEnum(global_logging_level)) return;
 
-    pub fn init(level: LoggingLevelEnum) @This() {
-      return .{
-        .level = level,
-      };
-    }
-
-    pub fn log(self: @This(), comptime level: LoggingLevelEnum, comptime format: []const u8, args: anytype) void {
-      if (@intFromEnum(level) > @intFromEnum(self.level)) return;
       const destination = switch (level) {
-        .@"error", .warning => std.io.getStdErr().writer(),
+        .err, .warn => std.io.getStdErr().writer(),
         else => std.io.getStdOut().writer(),
       };
       var buffered = std.io.bufferedWriter(destination);
       nosuspend {
-        buffered.print(level.string() ++ (if (scope == .default) ": " else "(" ++ @tagName(scope) ++ "): ") ++ format ++ "\n", args) catch {};
+        buffered.writer().print(level.string() ++ (if (scope == .default) ": " else "(" ++ @tagName(scope) ++ "): ") ++ format ++ "\n", args) catch {};
         buffered.flush() catch {};
       }
     }
   };
 }
 
-var global_logging_level: LoggingLevelEnum = switch (std.builtin.mode) {
+const global_logging_level: LoggingLevelEnum = switch (builtin.mode) {
   .Debug => .debug,
-  .ReleaseSafe => .warn,
-  .ReleaseFast, .ReleaseSmall => .info,
+  .ReleaseSafe => .info,
+  .ReleaseFast, .ReleaseSmall => .warn,
 };
 
 // This is to read cpu pressure
@@ -101,6 +92,7 @@ const CpuPressure = struct {
       },
     };
 
+    ScopedLogger(.cpu_pressure_parse).log(.verbose, "Parsed cpu pressure: {any}", .{retval});
     return retval;
   }
 
@@ -153,7 +145,7 @@ const CpuPressure = struct {
 
   pub const ReadCpuPressureError = ParseError || std.fs.File.ReadError || std.fs.File.OpenError;
   pub fn readCpuPressure() ReadCpuPressureError!@This() {
-    var buf: [128]u8 = undefined;
+    var buf: [64]u8 = undefined;
 
     const read_result = try std.fs.cwd().readFile("/proc/pressure/cpu", &buf);
     return @This().fromString(read_result);
@@ -161,7 +153,6 @@ const CpuPressure = struct {
 };
 
 test CpuPressure {
-  // Note: even though support for `full` is dropped, it still exists in the file
   const strings_to_parse = [_][]const u8{(
     \\some avg10=1.11 avg60=2.22 avg300=3.33 total=123
     \\full avg10=0.00 avg60=0.00 avg300=0.00 total=0
@@ -169,9 +160,8 @@ test CpuPressure {
   ), (
     \\some avg10=1.11 avg60=2.22 avg300=3.33 total=123
     \\
-  // ), (
-  //   \\some avg10=1.11 avg60=2.22 avg300=3.33 total=123
   )};
+
 
   inline for (strings_to_parse) |s| {
     try std.testing.expectEqual(
@@ -197,15 +187,9 @@ fn setOomUnkillable() SetOomUnkillableError!void {
 
 // The cpu states
 const Cpu = struct {
-  dir_name: []const u8,
   // Trur if online file exists (if this cpu can be offlined)
   online_file_name: ?[]const u8,
   online_now: bool,
-
-  cpufreq: CpuFreq = .{},
-
-  // TODO: Maybe implement this
-  const CpuFreq = struct{};
 
   pub const DataError = error {
     NoData,
@@ -221,9 +205,6 @@ const Cpu = struct {
     const online_file_with_error = cpu_dir.openFile(string_online, .{});
 
     if (online_file_with_error == error.FileNotFound) {
-      self.dir_name = try allocator.dupe(u8, dir);
-      errdefer allocator.free(self.dir_name);
-
       self.online_file_name = null;
       // TODO: Figure out if this needs to be changed
       self.online_now = true;
@@ -234,7 +215,9 @@ const Cpu = struct {
       var output: [3]u8 = undefined; // 2 because we wanna error if file contains more/less than 1 character
       switch (try online_file.readAll(&output)) {
         0 => return InitError.NoData,
-        1 => {}, // Unexpected but ok
+        1 => { // Unexpected but ok
+          ScopedLogger(.cpu_online_read).log(.debug, "Unexpected format in online file, no trailing newline", .{});
+        },
         2 => { // expected
           if (output[1] != '\n') return InitError.UnexpectedData;
         },
@@ -244,7 +227,6 @@ const Cpu = struct {
       const online_file_path = try std.fs.path.join(allocator, &[_][]const u8{dir, string_online});
       errdefer allocator.free(online_file_path);
 
-      self.dir_name = online_file_path[0..dir.len];
       self.online_file_name = online_file_path;
       self.online_now = switch(output[0]) {
         '0' => false,
@@ -279,7 +261,8 @@ const Cpu = struct {
     }
   }
 
-  pub fn setOnline(self: *@This(), online: bool) SetOnlineError!void {
+  // Doesnt do unnecessary write if we are already in the desired state
+  pub fn setOnlineChecked(self: *@This(), online: bool) SetOnlineError!void {
     if (self.online_now == online) return;
     return self.setOnlineUnchecked(online);
   }
@@ -294,7 +277,9 @@ const Cpu = struct {
       var output: [3]u8 = undefined; // 2 because we wanna error if file contains more/less than 1 character
       switch (try online_file.readAll(&output)) {
         0 => return InitError.NoData,
-        1 => {}, // Unexpected but ok
+        1 => { // Unexpected but ok
+          ScopedLogger(.cpu_online_read).log(.debug, "Unexpected format in online file, no trailing newline", .{});
+        },
         2 => { // expected
           if (output[1] != '\n') return InitError.UnexpectedData;
         },
@@ -318,7 +303,7 @@ const AllCpus = struct {
   const cpus_dir_name = "/sys/devices/system/cpu/";
 
   // std.fs.Dir.IteratorError is not marked pub !!
-  const IteratorError = error{
+  const IteratorError = error {
       AccessDenied,
       SystemResources,
       InvalidUtf8,
@@ -348,13 +333,23 @@ const AllCpus = struct {
       };
       if (!is_numeric) continue;
 
+      ScopedLogger(.cpu_list).log(.info, "Found {s}", .{entry.name});
+
       const this_cpu_dir_name = try std.fs.path.join(allocator, &[_][]const u8{cpus_dir_name, entry.name});
       defer allocator.free(this_cpu_dir_name);
 
       var this_cpu_dir = try cpus_dir.openDir(entry.name, .{});
       defer this_cpu_dir.close();
 
-      try cpu_list.append(try Cpu.init(allocator, this_cpu_dir_name, this_cpu_dir));
+      const cpu = try Cpu.init(allocator, this_cpu_dir_name, this_cpu_dir);
+
+      if (cpu.online_file_name == null) {
+        ScopedLogger(.cpu_list).log(.info, "Setting status of {s} is not supported", .{entry.name});
+      } else {
+        ScopedLogger(.cpu_list).log(.info, "Cpu {s} is {s}online", .{ entry.name, if (cpu.online_now) "" else "*NOT* " });
+      }
+
+      try cpu_list.append(cpu);
     }
 
     self.cpu_list = try cpu_list.toOwnedSlice();
@@ -403,10 +398,10 @@ const AllCpus = struct {
   pub const AdjustSleepingCpusError = Cpu.SetOnlineError || CpuPressure.ReadCpuPressureError;
   pub fn adjustSleepingCpus(self: *@This()) AdjustSleepingCpusError!void {
     const newPressure = try CpuPressure.readCpuPressure();
-    if (newPressure.some.avg10 > 30) {
+    if (newPressure.some.avg10 > 30_00) {
       std.debug.print("Wake 1\n", .{});
       try self.wakeOne();
-    } else if (newPressure.some.avg10 < 2) {
+    } else if (newPressure.some.avg10 < 2_00) {
       std.debug.print("Sleep 1\n", .{});
       try self.sleepOne();
     }
