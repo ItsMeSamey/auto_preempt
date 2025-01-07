@@ -1,7 +1,7 @@
 // Build Cmd: zig build-exe main.zig -OReleaseFast -fstrip -fsingle-threaded -fincremental -flto -mno-red-zone
 // TODOS's:
-//    Wakeup using poll() instead of busy loop
-//    register a handler even if we are unexpectedly killed, and restore the original state in this case
+//    add cli args
+//    add more todo's ;)
 const std = @import("std");
 const builtin = @import("builtin");
 
@@ -150,47 +150,44 @@ const CpuPressure = struct {
     return @This().fromString(read_result);
   }
 
-  pub const SubscribeError = error {
-    FileOpenError,
-    WriteError,
-  };
+  pub const SubscribeError = std.posix.OpenError || std.fs.File.WriteError;
   // Time limit for window_us is 500ms to 10s
-  pub fn subscribe(stall_limit_us: u32, window_us: u32) SubscribeError!std.os.linux.pollfd {
-    std.debug.assert(window_us > 500_000);
-    std.debug.assert(window_us < 10_00_000);
+  pub fn subscribe(stall_limit_us: u32, window_us: u32) SubscribeError!std.posix.pollfd {
+    std.debug.assert(window_us >= 500_000);
+    std.debug.assert(window_us <= 10_00_000);
     std.debug.assert(stall_limit_us < window_us);
 
-    const fd_usize = try std.os.linux.open("/proc/pressure/cpu/cpu0/cpufreq/stats", std.os.linux.O{ .ACCMODE = .RDWR, .NONBLOCK = true}, 0);
-    const fd = @as(std.os.linux.fd_t, @bitCast(@as(std.meta.Int(.unsigned, @sizeOf(std.os.linux.fd_t)), @truncate(fd_usize))));
-    if (fd < 0) return SubscribeError.FileOpenError;
-    var retval: std.os.linux.pollfd = undefined;
-    retval.fd = fd;
-    retval.events = std.os.linux.POLL.PRI;
-    retval.revents = 0;
+    const retval: std.posix.pollfd = .{
+      .fd = try std.posix.openZ("/proc/pressure/cpu", .{ .ACCMODE = .RDWR, .NONBLOCK = true}, 0),
+      .events = std.posix.POLL.PRI,
+      .revents = 0,
+    };
     errdefer closeSubscription(retval);
 
     var buf: [6 + 10 + 10 + 1]u8 = undefined; // 6 for ("some " & " "), 10 for stall_limit_us, 10 for window_us + 1 for '\x00'
-    const buf_count = std.io.fixedBufferStream(@as([]u8, &buf)).writer().print("some {d} {d}\x00", .{stall_limit_us, window_us}) catch unreachable;
-    var count: usize = 0;
-    while (count < buf_count) count += try std.os.linux.write(fd, &buf, count);
-    if (count > buf_count) return SubscribeError.WriteError;
+    var buf_stream = std.io.fixedBufferStream(@as([]u8, &buf));
+    buf_stream.writer().print("some {d} {d}\x00", .{stall_limit_us, window_us}) catch unreachable;
+    var file = std.fs.File{ .handle = retval.fd };
+    try file.writeAll(buf[0..buf_stream.pos]);
     return retval;
   }
 
-  pub fn closeSubscription(fd: std.os.linux.fd_t) void {
-    std.os.linux.close(fd);
+  pub fn closeSubscription(pollfd: std.posix.pollfd) void {
+    std.posix.close(pollfd.fd);
   }
 
   // can provide a slice or a single item pointer to pollfd struct(s)
   // timeout_ms is in microseconds, 0 means immediate return, negative means infinite wait
-  const PollError = error { PollError };
-  pub fn waitForPressure(pollfds: anytype, timeout_ms: i32) PollError!void {
-    comptime std.debug.assert(@TypeOf(pollfds) == *std.os.linux.pollfd or @TypeOf(pollfds) == []std.os.linux.pollfd);
-    const len: usize = if (@TypeOf(pollfds) == *std.os.linux.pollfd) 1 else pollfds.len;
-    const ptr: [*]std.os.linux.pollfd = if (@TypeOf(pollfds) == *std.os.linux.pollfd) pollfds else pollfds.ptr;
-    const result_usize = std.os.linux.poll(ptr, len, timeout_ms);
-    const result = @as(c_int, @bitCast(@as(std.meta.Int(.unsigned, @sizeOf(c_int)), @truncate(result_usize))));
-    if (result < 0) return PollError.PollError;
+  pub fn waitForPressure(pollfds: anytype, timeout_ms: i32) std.posix.PollError!usize {
+    comptime std.debug.assert(@TypeOf(pollfds) == *std.posix.pollfd or @TypeOf(pollfds) == []std.posix.pollfd);
+    var fds: []std.posix.pollfd = undefined;
+    if (@TypeOf(pollfds) == []std.posix.pollfd) {
+      fds = pollfds;
+    } else {
+      fds.ptr = @ptrCast(pollfds);
+      fds.len = 1;
+    }
+    return std.posix.poll(fds, timeout_ms);
   }
 };
 
@@ -374,9 +371,9 @@ const AllCpus = struct {
       const cpu = try Cpu.init(allocator, this_cpu_dir_name);
 
       if (cpu.online_file_name == null) {
-        ScopedLogger(.cpu_list).log(.info, "Setting status of {s} is not supported", .{entry.name});
+        ScopedLogger(.cpu_list).log(.info, "{s} does NOT support setting online status", .{entry.name});
       } else {
-        ScopedLogger(.cpu_list).log(.info, "Cpu {s} is {s}online", .{ entry.name, if (cpu.online_now) "" else "*NOT* " });
+        ScopedLogger(.cpu_list).log(.info, "{s} is {s}online", .{ entry.name, if (cpu.online_now) "" else "*NOT* " });
       }
 
       try cpu_list.append(cpu);
@@ -415,7 +412,7 @@ const AllCpus = struct {
     self.sleeping_list.deinit(allocator);
     self.sleepable_list.deinit(allocator);
 
-    for (self.cpu_list) |cpu| cpu.deinit(allocator);
+    for (self.cpu_list) |*cpu| cpu.deinit(allocator);
     allocator.free(self.cpu_list);
   }
 
@@ -427,6 +424,7 @@ const AllCpus = struct {
 
   pub fn wakeOne(self: *@This()) Cpu.SetOnlineError!void {
     const last = self.sleeping_list.popOrNull() orelse return;
+    ScopedLogger(.all_cpus).log(.debug, "wake 1 cpu", .{});
     errdefer self.sleeping_list.appendAssumeCapacity(last);
     try last.setOnlineUnchecked(true);
     self.sleepable_list.appendAssumeCapacity(last);
@@ -434,6 +432,7 @@ const AllCpus = struct {
 
   pub fn sleepOne(self: *@This()) Cpu.SetOnlineError!void {
     const last = self.sleepable_list.popOrNull() orelse return;
+    ScopedLogger(.all_cpus).log(.debug, "sleep 1 cpu", .{});
     errdefer self.sleepable_list.appendAssumeCapacity(last);
     try last.setOnlineUnchecked(false);
     self.sleeping_list.appendAssumeCapacity(last);
@@ -441,8 +440,10 @@ const AllCpus = struct {
 
   pub fn restoreCpuState(self: *@This()) Cpu.SetOnlineError!void {
     var return_error: Cpu.SetOnlineError!void = {};
-    for (self.cpu_list) |entry| {
+    const Logger = ScopedLogger(.restore_cpu_state);
+    for (self.cpu_list) |*entry| {
       if (entry.online_file_name == null) continue;
+      Logger.log(.debug, "Restoring state of {s} to {s}", .{entry.online_file_name.?, if (entry.initital_state) "online" else "offline"});
       if (entry.online_now == entry.initital_state) continue;
       entry.setOnlineUnchecked(entry.initital_state) catch |e| {
         ScopedLogger(.cpu_list).log(
@@ -456,17 +457,22 @@ const AllCpus = struct {
     return return_error;
   }
 
-  // pub const AdjustSleepingCpusError = Cpu.SetOnlineError || CpuPressure.ReadError;
-  // pub fn adjustSleepingCpus(self: *@This()) AdjustSleepingCpusError!void {
-  //   const newPressure = try CpuPressure.readCpuPressure();
-  //   if (newPressure.some.avg10 > 30_00) {
-  //     std.debug.print("Wake 1\n", .{});
-  //     try self.wakeOne();
-  //   } else if (newPressure.some.avg10 < 2_00) {
-  //     std.debug.print("Sleep 1\n", .{});
-  //     try self.sleepOne();
-  //   }
-  // }
+  pub fn setAllState(self: *@This(), online: bool) Cpu.SetOnlineError!void {
+    for (self.cpu_list) |*entry| {
+      if (entry.online_file_name == null) continue;
+      try entry.setOnlineChecked(online);
+    }
+  }
+
+  pub const AdjustSleepingCpusError = Cpu.SetOnlineError || CpuPressure.ReadError;
+  pub fn adjustSleepingCpus(self: *@This()) AdjustSleepingCpusError!void {
+    const newPressure = try CpuPressure.readCpuPressure();
+    if (newPressure.some.avg10 > 30_00) {
+      try self.wakeOne();
+    } else if (newPressure.some.avg10 < 2_00) {
+      try self.sleepOne();
+    }
+  }
 };
 
 pub const MakeOomUnkillableError = std.fs.File.OpenError || std.fs.File.WriteError;
@@ -476,69 +482,79 @@ pub fn makeOomUnkillable() MakeOomUnkillableError!void {
   try file.writeAll("-1000\n");
 }
 
+pub fn signalName(signal: i32) [20]u8 {
+  const decls = @typeInfo(std.posix.SIG).@"struct".decls;
+  inline for (decls) |decl| {
+    const decl_val = @field(std.posix.SIG, decl.name);
+    const decl_type_info = @typeInfo(@TypeOf(decl_val));
+    if (decl_type_info != .int and decl_type_info != .comptime_int) continue;
+    comptime if (std.mem.eql(u8, decl.name, "BLOCK") or std.mem.eql(u8, decl.name, "UNBLOCK") or std.mem.eql(u8, decl.name, "SETMASK")) continue;
+
+    if (signal == decl_val) {
+      const retval = "SIG" ++ decl.name ++ "\x00";
+      const padding = [_]u8{undefined} ** (20 - retval.len);
+      return (retval ++ padding).*;
+    }
+  }
+  var buf: [20]u8 = undefined;
+  _ = std.fmt.bufPrint(&buf, "UNKNOWN({d})\x00", .{signal}) catch unreachable;
+  return buf;
+}
+
 pub fn registerSignalHandlers() void {
-  const handle_killaction: std.os.linux.Sigaction = .{
+  const handle_killaction: std.posix.Sigaction = std.posix.Sigaction{
     .handler = .{
       .handler = struct {
         fn handler(signal: i32) callconv(.C) void {
           const Logger = ScopedLogger(.signal_handler);
 
-          Logger.log(.warn, "Caught signal {s}", .{@tagName(@as(std.os.linux.SIG, @enumFromInt(signal)))});
+          const signal_name = signalName(signal);
+          Logger.log(.warn, "Caught {s}", .{@as([*:0]const u8, @ptrCast(&signal_name))});
+          Logger.log(.warn, "Restoring state of all the Cpu's", .{});
           allCpus.restoreCpuState() catch |e| {
             Logger.log(.err, "Cpu state restore failed with error: {!}", .{e});
-            Logger.log(.warn, "Exiting", .{});
-            std.os.linux.exit(1);
+            std.posix.exit(1);
           };
-          std.os.linux.exit(0);
+          Logger.log(.warn, "Exiting", .{});
+          std.posix.exit(0);
         }
       }.handler,
     },
+    .mask = std.posix.filled_sigset, // Block all signals
     .flags = 0, // std.os.linux.SA.
-    .mask = std.os.linux.filled_sigset, // Block all signals
   };
-  const killers = [_]std.os.linux.SIG{
-    .HUP,
-    .INT,
-    .QUIT,
-    .ILL,
-    .TRAP,
-    .ABRT,
-    .IOT,
-    .BUS,
-    .FPE,
-    .SEGV,
-    .PIPE,
-    .TERM,
-    .STOP,
-    .XCPU,
-    .STKFLT,
+  const killers = [_]comptime_int{
+    std.posix.SIG.HUP,
+    std.posix.SIG.INT,
+    std.posix.SIG.QUIT,
+    std.posix.SIG.ILL,
+    std.posix.SIG.TRAP,
+    std.posix.SIG.ABRT,
+    std.posix.SIG.IOT,
+    std.posix.SIG.BUS,
+    std.posix.SIG.FPE,
+    std.posix.SIG.SEGV,
+    std.posix.SIG.PIPE,
+    std.posix.SIG.TERM,
+    std.posix.SIG.XCPU,
+    std.posix.SIG.STKFLT,
   };
   inline for (killers) |signal| {
-    switch (std.posix.errno(std.os.linux.sigaction(signal, &handle_killaction, null))) {
-      .SUCCESS => {},
-      // Programmer Error, invalid signal passed to siaction
-      .INVAL => unreachable,
-      else => unreachable,
-    }
+    std.posix.sigaction(signal, &handle_killaction, null);
   }
 
-  const ignore_action: std.os.linux.Sigaction = .{
+  const ignore_action: std.posix.Sigaction = std.posix.Sigaction{
     .handler = .{
-      .handler = std.os.linux.SIG.IGN,
-      .flags = 0,
-      .mask = std.os.linux.empty_sigset,
-    }
+      .handler = std.posix.SIG.IGN,
+    },
+    .flags = 0,
+    .mask = std.posix.empty_sigset,
   };
-  const ignorables = [_]std.os.linux.SIG{
-    .TSTP,
+  const ignorables = [_]comptime_int{
+    std.posix.SIG.TSTP,
   };
   inline for (ignorables) |signal| {
-    switch (std.posix.errno(std.os.linux.sigaction(signal, &ignore_action, null))) {
-      .SUCCESS => {},
-      // Programmer Error, invalid signal passed to siaction
-      .INVAL => unreachable,
-      else => unreachable,
-    }
+    std.posix.sigaction(signal, &ignore_action, null);
   }
 }
 
@@ -559,12 +575,34 @@ pub fn main() !void {
   allCpus = try AllCpus.init(allocator);
   registerSignalHandlers();
   defer allCpus.deinit(allocator);
-
-  while (true) {
-    allCpus.adjustSleepingCpus() catch |e| {
-      std.debug.print("An Error occurred {!}\n", .{ e });
+  errdefer {
+    allCpus.restoreCpuState() catch |e| {
+      const Logger = ScopedLogger(.cpu_adjust_main);
+      Logger.log(.err, "Cpu state restore failed with error: {!}", .{e});
+      Logger.log(.warn, "Exiting", .{});
+      std.os.linux.exit(1);
     };
-    std.time.sleep(10 * std.time.ns_per_s);
+  }
+
+  var sub = try CpuPressure.subscribe(150_000, 500_000);
+
+  const LoopLogger = ScopedLogger(.main_loop);
+  while (true) {
+    const ev_count = try CpuPressure.waitForPressure(&sub, 5_000);
+
+    if (ev_count == 0) {
+      try allCpus.adjustSleepingCpus();
+      continue;
+    }
+
+    LoopLogger.log(.debug, "Cpu pressure event received", .{});
+    if (sub.revents & std.posix.POLL.ERR != 0) {
+      return error.PollError;
+    } else if (sub.revents & std.posix.POLL.PRI == 0) {
+      return error.UnknownEvent;
+    }
+
+    try allCpus.wakeOne();
   }
 }
 
