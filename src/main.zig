@@ -142,8 +142,8 @@ const CpuPressure = struct {
     }
   }
 
-  pub const ReadCpuPressureError = ParseError || std.fs.File.ReadError || std.fs.File.OpenError;
-  pub fn readCpuPressure() ReadCpuPressureError!@This() {
+  pub const ReadError = ParseError || std.fs.File.ReadError || std.fs.File.OpenError;
+  pub fn readCpuPressure() ReadError!@This() {
     var buf: [64]u8 = undefined;
 
     const read_result = try std.fs.cwd().readFile("/proc/pressure/cpu", &buf);
@@ -170,11 +170,10 @@ const CpuPressure = struct {
     errdefer closeSubscription(retval);
 
     var buf: [6 + 10 + 10 + 1]u8 = undefined; // 6 for ("some " & " "), 10 for stall_limit_us, 10 for window_us + 1 for '\x00'
-    const count = std.io.fixedBufferStream(@as([]u8, &buf)).writer().print("some {d} {d}\x00", .{stall_limit_us, window_us}) catch unreachable;
-    const write_usize = try std.os.linux.write(fd, &buf, count);
-    const write_result = @as(c_int, @bitCast(@as(std.meta.Int(.unsigned, @sizeOf(c_int)), @truncate(write_usize))));
-    if (write_result < 0) return SubscribeError.WriteError;
-
+    const buf_count = std.io.fixedBufferStream(@as([]u8, &buf)).writer().print("some {d} {d}\x00", .{stall_limit_us, window_us}) catch unreachable;
+    var count: usize = 0;
+    while (count < buf_count) count += try std.os.linux.write(fd, &buf, count);
+    if (count > buf_count) return SubscribeError.WriteError;
     return retval;
   }
 
@@ -204,7 +203,6 @@ test CpuPressure {
     \\some avg10=1.11 avg60=2.22 avg300=3.33 total=123
     \\
   )};
-
 
   inline for (strings_to_parse) |s| {
     try std.testing.expectEqual(
@@ -427,39 +425,124 @@ const AllCpus = struct {
     }
   }
 
-  pub const AdjustSleepingCpusError = Cpu.SetOnlineError || CpuPressure.ReadCpuPressureError;
-  pub fn adjustSleepingCpus(self: *@This()) AdjustSleepingCpusError!void {
-    const newPressure = try CpuPressure.readCpuPressure();
-    if (newPressure.some.avg10 > 30_00) {
-      std.debug.print("Wake 1\n", .{});
-      try self.wakeOne();
-    } else if (newPressure.some.avg10 < 2_00) {
-      std.debug.print("Sleep 1\n", .{});
-      try self.sleepOne();
-    }
-  }
-
-  fn wakeOne(self: *@This()) Cpu.SetOnlineError!void {
+  pub fn wakeOne(self: *@This()) Cpu.SetOnlineError!void {
     const last = self.sleeping_list.popOrNull() orelse return;
     errdefer self.sleeping_list.appendAssumeCapacity(last);
     try last.setOnlineUnchecked(true);
     self.sleepable_list.appendAssumeCapacity(last);
   }
 
-  fn sleepOne(self: *@This()) Cpu.SetOnlineError!void {
+  pub fn sleepOne(self: *@This()) Cpu.SetOnlineError!void {
     const last = self.sleepable_list.popOrNull() orelse return;
     errdefer self.sleepable_list.appendAssumeCapacity(last);
     try last.setOnlineUnchecked(false);
     self.sleeping_list.appendAssumeCapacity(last);
   }
+
+  pub fn restoreCpuState(self: *@This()) Cpu.SetOnlineError!void {
+    var return_error: Cpu.SetOnlineError!void = {};
+    for (self.cpu_list) |entry| {
+      if (entry.online_file_name == null) continue;
+      if (entry.online_now == entry.initital_state) continue;
+      entry.setOnlineUnchecked(entry.initital_state) catch |e| {
+        ScopedLogger(.cpu_list).log(
+          .err,
+          "Failed to restore state of {s} to {s}. Error: {!}",
+          .{entry.online_file_name.?, if (entry.initital_state) "online" else "offline", e}
+        );
+        return_error = e;
+      };
+    }
+    return return_error;
+  }
+
+  // pub const AdjustSleepingCpusError = Cpu.SetOnlineError || CpuPressure.ReadError;
+  // pub fn adjustSleepingCpus(self: *@This()) AdjustSleepingCpusError!void {
+  //   const newPressure = try CpuPressure.readCpuPressure();
+  //   if (newPressure.some.avg10 > 30_00) {
+  //     std.debug.print("Wake 1\n", .{});
+  //     try self.wakeOne();
+  //   } else if (newPressure.some.avg10 < 2_00) {
+  //     std.debug.print("Sleep 1\n", .{});
+  //     try self.sleepOne();
+  //   }
+  // }
 };
 
 pub const MakeOomUnkillableError = std.fs.File.OpenError || std.fs.File.WriteError;
-fn makeOomUnkillable() MakeOomUnkillableError!void {
+pub fn makeOomUnkillable() MakeOomUnkillableError!void {
   var file = try std.fs.cwd().openFileZ("/proc/self/oom_score_adj", .{ .mode = .write_only });
   defer file.close();
   try file.writeAll("-1000\n");
 }
+
+pub fn registerSignalHandlers() void {
+  const handle_killaction: std.os.linux.Sigaction = .{
+    .handler = .{
+      .handler = struct {
+        fn handler(signal: i32) callconv(.C) void {
+          const Logger = ScopedLogger(.signal_handler);
+
+          Logger.log(.warn, "Caught signal {s}", .{@tagName(@as(std.os.linux.SIG, @enumFromInt(signal)))});
+          allCpus.restoreCpuState() catch |e| {
+            Logger.log(.err, "Cpu state restore failed with error: {!}", .{e});
+            Logger.log(.warn, "Exiting", .{});
+            std.os.linux.exit(1);
+          };
+          std.os.linux.exit(0);
+        }
+      }.handler,
+    },
+    .flags = 0, // std.os.linux.SA.
+    .mask = std.os.linux.filled_sigset, // Block all signals
+  };
+  const killers = [_]std.os.linux.SIG{
+    .HUP,
+    .INT,
+    .QUIT,
+    .ILL,
+    .TRAP,
+    .ABRT,
+    .IOT,
+    .BUS,
+    .FPE,
+    .SEGV,
+    .PIPE,
+    .TERM,
+    .STOP,
+    .XCPU,
+    .STKFLT,
+  };
+  inline for (killers) |signal| {
+    switch (std.posix.errno(std.os.linux.sigaction(signal, &handle_killaction, null))) {
+      .SUCCESS => {},
+      // Programmer Error, invalid signal passed to siaction
+      .INVAL => unreachable,
+      else => unreachable,
+    }
+  }
+
+  const ignore_action: std.os.linux.Sigaction = .{
+    .handler = .{
+      .handler = std.os.linux.SIG.IGN,
+      .flags = 0,
+      .mask = std.os.linux.empty_sigset,
+    }
+  };
+  const ignorables = [_]std.os.linux.SIG{
+    .TSTP,
+  };
+  inline for (ignorables) |signal| {
+    switch (std.posix.errno(std.os.linux.sigaction(signal, &ignore_action, null))) {
+      .SUCCESS => {},
+      // Programmer Error, invalid signal passed to siaction
+      .INVAL => unreachable,
+      else => unreachable,
+    }
+  }
+}
+
+var allCpus: AllCpus = undefined;
 
 pub fn main() !void {
   try makeOomUnkillable();
@@ -473,11 +556,12 @@ pub fn main() !void {
   }
   const allocator = gpa.allocator();
 
-  var all: AllCpus = try AllCpus.init(allocator);
-  defer all.deinit(allocator);
+  allCpus = try AllCpus.init(allocator);
+  registerSignalHandlers();
+  defer allCpus.deinit(allocator);
 
   while (true) {
-    all.adjustSleepingCpus() catch |e| {
+    allCpus.adjustSleepingCpus() catch |e| {
       std.debug.print("An Error occurred {!}\n", .{ e });
     };
     std.time.sleep(10 * std.time.ns_per_s);
