@@ -1,20 +1,23 @@
+fn myName(name_buf: anytype) []const u8 {
+  const self_name_file = std.fs.cwd().openFileZ("/proc/self/comm", .{ .mode = .read_only }) catch |e| {
+    ScopedLogger(.print_usage).log(.err, "Failed to get self exe path: {!}", .{e});
+    return "auto_preempt";
+  };
+  defer self_name_file.close();
+  var name_len = self_name_file.readAll(name_buf) catch |e| {
+    ScopedLogger(.print_usage).log(.err, "Failed to read self exe name: {!}", .{e});
+    return "auto_preempt";
+  };
+  if (name_buf[name_len - 1] == '\n') name_len -= 1;
+  return name_buf[0..name_len];
+}
+
 pub fn printUsageAndExit() noreturn {
   defer std.posix.exit(1);
   const stdout = std.io.getStdOut().writer();
 
-  var name_buf: [128]u8 = undefined;
-  const my_name = blk: {
-    const self_name_file = std.fs.cwd().openFileZ("/proc/self/comm", .{ .mode = .read_only }) catch |e| {
-      ScopedLogger(.print_usage).log(.err, "Failed to get self exe path: {!}", .{e});
-      break :blk "auto_preempt";
-    };
-    defer self_name_file.close();
-    const name_len = self_name_file.readAll(&name_buf) catch |e| {
-      ScopedLogger(.print_usage).log(.err, "Failed to read self exe name: {!}", .{e});
-      break :blk "auto_preempt";
-    };
-    break :blk name_buf[0..name_len];
-  };
+  var name_buf: [64]u8 = undefined;
+  const my_name = myName(&name_buf);
 
   nosuspend stdout.print(
     \\Usage: {s} [options] args ...
@@ -26,11 +29,15 @@ pub fn printUsageAndExit() noreturn {
     \\  install          Install this program in auto mode
     \\  install [mode]   Install this program
     \\    mode:
-    \\      auto         Automatically detect and install to /bin and if possible systemd mode
-    \\      bin          Install to /usr/bin only
+    \\      auto         Automatically detect and install to /bin and if possible systemd service
+    \\      bin          Install to /usr/bin
     \\      systemd      Install to /usr/bin + as systemd service as well
     \\  uninstall        Stop and Uninstall this program, also remove any autostart entries
     \\  uninstall [mode] Stop and Uninstall this program, also remove any autostart entries
+    \\    mode:
+    \\      auto         Automatically remove from /bin and if possible systemd service
+    \\      bin          Remove from /usr/bin
+    \\      systemd      Remove systemd service
     \\  start            Start this program normal mode (stay connected to terminal)
     \\                   NO need to install first
     \\  start [mode]     Start this program, program MUST be installed first
@@ -66,7 +73,6 @@ const preamble = @import("preamble.zig");
 const CpuStatus = @import("cpu_status.zig");
 const CpuPressure = @import("cpu_pressure.zig");
 const ScopedLogger = @import("logging.zig").ScopedLogger;
-const Operations = @import("operations.zig");
 
 pub var allCpus: CpuStatus.AllCpus = undefined;
 
@@ -79,13 +85,11 @@ pub fn install(allocator: std.mem.Allocator, sub_arg: ?[:0]const u8) NoError!voi
   preamble.ensureRoot();
   const Logger = ScopedLogger(.install);
 
-  const Installers = struct {
+  const Op = struct {
     pub fn systemd() void {
-      Logger.log(.info, "Installing systemd service", .{});
       setup.Systemd.install() catch |e| {
         Logger.fatal("Failed to install systemd service: {!}", .{e});
       };
-      Logger.log(.info, "Successfully installed systemd service", .{});
     }
 
     pub fn bin() setup.InstallBinResult {
@@ -103,37 +107,84 @@ pub fn install(allocator: std.mem.Allocator, sub_arg: ?[:0]const u8) NoError!voi
   };
 
   if (sub_arg == null) {
-    return Installers.auto();
+    return Op.auto();
   }
 
   switch (sub_arg.?.len) {
     3 => switch (meta.arrAsUint(sub_arg.?[0..3])) {
       meta.arrAsUint("bin") => {
-        _ = Installers.bin();
+        _ = Op.bin();
       },
       else => {},
     },
     4 => switch (meta.arrAsUint(sub_arg.?[0..4])) {
-      meta.arrAsUint("auto") => Installers.auto(),
+      meta.arrAsUint("auto") => Op.auto(),
       else => {},
     },
     7 => switch (meta.arrAsUint(sub_arg.?[0..7])) {
-      meta.arrAsUint("systemd") => Installers.systemd(),
+      meta.arrAsUint("systemd") => Op.systemd(),
       else => {},
     },
     else => {},
   }
   Logger.log(.err, "Unknown argument: {s}", .{sub_arg.?});
-  Operations.printUsageAndExit();
+  printUsageAndExit();
 }
 
 pub fn uninstall(allocator: std.mem.Allocator, sub_arg: ?[:0]const u8) NoError!void {
-  _ = sub_arg;
-  _ = allocator;
-  const Logger = ScopedLogger(.uninstall);
-  preamble.ensureRoot();
+  // TODO: stop service on install
+  _ = allocator; // unused
 
-  Logger.fatal("Unimplemented", .{});
+  preamble.ensureRoot();
+  const Logger = ScopedLogger(.uninstall);
+
+  const Op = struct {
+    pub fn systemd() void {
+      setup.Systemd.uninstall() catch |e| {
+        Logger.fatal("Failed to uninstall systemd service: {!}", .{e});
+      };
+    }
+
+    pub fn bin() void {
+      return setup.uninstallBin() catch |e| {
+        Logger.fatal("Failed to install binary: {!}", .{e});
+      };
+    }
+
+    pub fn auto() void {
+      bin();
+      if (
+        setup.isInitSystem("systemd") catch |e| Logger.fatal("Error detecting init system: {!}", .{e}) and
+        setup.Systemd.check() catch |e| Logger.fatal("Error detecting if systemd service is present: {!}", .{e})
+      ) {
+        systemd();
+      }
+    }
+  };
+
+  if (sub_arg == null) {
+    return Op.auto();
+  }
+
+  switch (sub_arg.?.len) {
+    3 => switch (meta.arrAsUint(sub_arg.?[0..3])) {
+      meta.arrAsUint("bin") => {
+        _ = Op.bin();
+      },
+      else => {},
+    },
+    4 => switch (meta.arrAsUint(sub_arg.?[0..4])) {
+      meta.arrAsUint("auto") => Op.auto(),
+      else => {},
+    },
+    7 => switch (meta.arrAsUint(sub_arg.?[0..7])) {
+      meta.arrAsUint("systemd") => Op.systemd(),
+      else => {},
+    },
+    else => {},
+  }
+  Logger.log(.err, "Unknown argument: {s}", .{sub_arg.?});
+  printUsageAndExit();
 }
 
 pub fn start(allocator: std.mem.Allocator, sub_arg: ?[:0]const u8) NoError!void {
@@ -204,21 +255,95 @@ pub fn stop(allocator: std.mem.Allocator, sub_arg: ?[:0]const u8) NoError!void {
 }
 
 pub fn enable(allocator: std.mem.Allocator, sub_arg: ?[:0]const u8) NoError!void {
-  _ = sub_arg;
-  _ = allocator;
-  const Logger = ScopedLogger(.enable);
-  preamble.ensureRoot();
+  _ = allocator; // unused
 
-  Logger.fatal("Unimplemented", .{});
+  preamble.ensureRoot();
+  const Logger = ScopedLogger(.enable);
+
+  const Op = struct {
+    pub fn systemd(sub: ?[:0]const u8) void {
+      setup.Systemd.enable() catch |e| {
+        Logger.fatal("Failed to uninstall systemd service: {!}", .{e});
+      };
+      var name_buf: [64]u8 = undefined;
+      const my_name = myName(&name_buf);
+      // TODO: handle already running
+      Logger.log(.info, "To enable service, run `{s} enable{s}{s}`", .{my_name, if (sub == null) "" else " ", sub orelse ""});
+    }
+
+    pub fn auto(sub: ?[:0]const u8) void {
+      if (setup.isInitSystem("systemd") catch |e| Logger.fatal("Error detecting init system: {!}", .{e})) {
+        systemd(sub);
+      } else {
+        Logger.log(.warn, "No compatible init system detected, no-op", .{});
+      }
+    }
+  };
+
+  if (sub_arg == null) {
+    return Op.auto(sub_arg);
+  }
+
+  switch (sub_arg.?.len) {
+    4 => switch (meta.arrAsUint(sub_arg.?[0..4])) {
+      meta.arrAsUint("auto") => Op.auto(sub_arg),
+      else => {},
+    },
+    7 => switch (meta.arrAsUint(sub_arg.?[0..7])) {
+      meta.arrAsUint("systemd") => Op.systemd(sub_arg),
+      else => {},
+    },
+    else => {},
+  }
+  Logger.log(.err, "Unknown argument: {s}", .{sub_arg.?});
+  printUsageAndExit();
 }
 
 pub fn disable(allocator: std.mem.Allocator, sub_arg: ?[:0]const u8) NoError!void {
-  _ = sub_arg;
-  _ = allocator;
-  const Logger = ScopedLogger(.disable);
-  preamble.ensureRoot();
+  _ = allocator; // unused
 
-  Logger.fatal("Unimplemented", .{});
+  preamble.ensureRoot();
+  const Logger = ScopedLogger(.enable);
+
+  const Op = struct {
+    pub fn systemd(sub: ?[:0]const u8) void {
+      _ = sub;
+      setup.Systemd.disable() catch |e| {
+        Logger.fatal("Failed to uninstall systemd service: {!}", .{e});
+      };
+
+      // TODO: Add context, Handle not running / running
+      var name_buf: [64]u8 = undefined;
+      const my_name = myName(&name_buf);
+      Logger.log(.info, "To remove service, run `{s} uninstall systemd`", .{ my_name });
+    }
+
+    pub fn auto(sub: ?[:0]const u8) void {
+      if (setup.isInitSystem("systemd") catch |e| Logger.fatal("Error detecting init system: {!}", .{e})) {
+        systemd(sub);
+      } else {
+        Logger.log(.warn, "No compatible init system detected, no-op", .{});
+      }
+    }
+  };
+
+  if (sub_arg == null) {
+    return Op.auto(sub_arg);
+  }
+
+  switch (sub_arg.?.len) {
+    4 => switch (meta.arrAsUint(sub_arg.?[0..4])) {
+      meta.arrAsUint("auto") => Op.auto(sub_arg),
+      else => {},
+    },
+    7 => switch (meta.arrAsUint(sub_arg.?[0..7])) {
+      meta.arrAsUint("systemd") => Op.systemd(sub_arg),
+      else => {},
+    },
+    else => {},
+  }
+  Logger.log(.err, "Unknown argument: {s}", .{sub_arg.?});
+  printUsageAndExit();
 }
 
 pub fn status(allocator: std.mem.Allocator, sub_arg: ?[:0]const u8) NoError!void {
