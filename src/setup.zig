@@ -15,13 +15,13 @@ fn checkExists(comptime path: [*:0]const u8) std.fs.Dir.AccessError!bool {
   return true;
 }
 
-const InstallBinResult = enum {
+pub const InstallBinResult = enum {
   newerExists,
   sameExists,
   installed,
   updated,
 };
-const InstallBinError = std.fs.Dir.AccessError || std.process.Child.RunError || std.fs.Dir.DeleteFileError || std.fs.Dir.CopyFileError;
+pub const InstallBinError = std.fs.Dir.AccessError || std.process.Child.RunError || std.fs.Dir.DeleteFileError || std.fs.Dir.CopyFileError;
 pub fn installBin() InstallBinError!InstallBinResult {
   const Logger = ScopedLogger(.install_bin);
 
@@ -68,7 +68,7 @@ pub fn installBin() InstallBinError!InstallBinResult {
   return .installed;
 }
 
-const GetInitNameError = std.fs.File.OpenError || std.fs.File.ReadError;
+pub const GetInitNameError = std.fs.File.OpenError || std.fs.File.ReadError;
 fn getInitName() GetInitNameError![]u8 {
   const Static = struct {
     var buf = [_]u8{0} ** 16;
@@ -92,7 +92,7 @@ pub fn isInitSystem(comptime name: []const u8) GetInitNameError!bool {
   return meta.asUint(name.len, name) == meta.asUint(name.len, result);
 }
 
-const CreateServiceError = std.fs.File.OpenError || std.fs.File.WriteError;
+pub const CreateServiceError = std.fs.File.OpenError || std.fs.File.WriteError;
 
 pub const Systemd = struct {
   const systemd_service_dest = "/etc/systemd/system/auto_preempt.service";

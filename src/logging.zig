@@ -32,6 +32,16 @@ pub fn ScopedLogger(comptime scope: @TypeOf(.enum_literal)) type {
         buffered.flush() catch {};
       }
     }
+
+    pub fn fatal(comptime format: []const u8, args: anytype) noreturn {
+      const destination = std.io.getStdErr().writer();
+      var buffered = std.io.bufferedWriter(destination);
+      nosuspend {
+        buffered.writer().print("FATAL" ++ (if (scope == .default) ": " else "(" ++ @tagName(scope) ++ "): ") ++ format ++ "\n", args) catch {};
+        buffered.flush() catch {};
+      }
+      std.posix.exit(1);
+    }
   };
 }
 
