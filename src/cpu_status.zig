@@ -1,4 +1,5 @@
 const std = @import("std");
+const meta = @import("meta.zig");
 const CpuPressure = @import("cpu_pressure.zig");
 const ScopedLogger = @import("logging.zig").ScopedLogger;
 
@@ -9,6 +10,7 @@ const string_online = "online";
 // The cpu states
 pub const Cpu = struct {
   /// Path to cpu's online file
+  /// ends with \x00 (like c strings)
   online_file_name: ?[16]u8, // "cpu<number>/online", we allow number to be upto 5 digits long (enough for 2^16 cpus)
   /// If the cpu is online currently
   online_now: bool,
@@ -172,7 +174,7 @@ pub const AllCpus = struct {
 
     var iterator = cpus_dir.iterate();
     while (try iterator.next()) |entry| {
-      if (entry.name.len < 4 or @as(u24, @bitCast(entry.name[0..3].*)) != @as(u24, @bitCast([3]u8{'c', 'p', 'u'}))) continue;
+      if (entry.name.len < 4 or meta.arrAsUint(entry.name[0..3].*) != meta.arrAsUint("cpu")) continue;
       const is_numeric = blk: {
         for (entry.name[3..]) |char| {
           if (char < '0' or '9' < char) break :blk false;

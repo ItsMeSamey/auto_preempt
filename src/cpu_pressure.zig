@@ -1,6 +1,7 @@
 //! This is to read cpu pressure
 //! For more info see https://docs.kernel.org/accounting/psi.html
 const std = @import("std");
+const meta = @import("meta.zig");
 const ScopedLogger = @import("logging.zig").ScopedLogger;
 
 pub const CpuPressureResultType = struct {
@@ -56,7 +57,7 @@ fn parseFloatSkip(data_ptr: *[]const u8, comptime to_skip: anytype) ParseError!u
     return 1000 * @as(u16, data[0] - '0') + 100 * @as(u16, data[1] - '0') + 10 * @as(u16, data[3] - '0') + @as(u16, data[4] - '0');
   } else if (data[3] == '.') {
     if (data.len < 6 + to_skip.len) return ParseError.UnexpectedEndOfString;
-    if (@as(u48, @bitCast(data[0..6].*)) != @as(u48, @bitCast([_]u8{'1', '0', '0', '.', '0', '0'}))) return ParseError.InvalidFloatFormat;
+    if (meta.arrAsUint(data[0..6].*) != meta.arrAsUint("100.00")) return ParseError.InvalidFloatFormat;
 
     if (data[6] != to_skip[0]) return scalar_error;
     data_ptr.* = data[6 + to_skip.len..];
