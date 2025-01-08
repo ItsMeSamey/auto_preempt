@@ -13,7 +13,7 @@ pub fn asUint(comptime len: comptime_int, slice: anytype) IntType(len, @TypeOf(s
   const pointer, const childType = switch (@typeInfo(@TypeOf(slice))) {
     .pointer => |info| switch (info.size) {
       .One => .{slice, @typeInfo(info.child).array.child}, // pointer to an array
-      .Slice => .{slice.len, info.child}, // slice
+      .Slice => .{slice.ptr, info.child}, // slice
       .Many, .C => .{slice, info.child}, // many pointer
     },
     .array => |info| .{&slice, info.child},

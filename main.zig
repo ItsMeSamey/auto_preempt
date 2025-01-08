@@ -8,18 +8,13 @@
 //    more todo's ;)
 
 const std = @import("std");
-const builtin = @import("builtin");
-const preamble = @import("src/preamble.zig");
-const CpuStatus = @import("src/cpu_status.zig");
+const meta = @import("src/meta.zig");
 const ScopedLogger = @import("src/logging.zig").ScopedLogger;
-const CpuPressure = @import("src/cpu_pressure.zig");
+const Operations = @import("src/operations.zig");
 
-pub var allCpus: CpuStatus.AllCpus = undefined;
+const VERSION = "v0.1.0";
 
 pub fn main() !void {
-  preamble.ensureRoot();
-  try preamble.makeOomUnkillable();
-
   var gpa = std.heap.GeneralPurposeAllocator(.{}){};
   defer {
     const leaks = gpa.deinit();
@@ -29,38 +24,56 @@ pub fn main() !void {
   }
   const allocator = gpa.allocator();
 
-  allCpus = try CpuStatus.AllCpus.init(allocator);
-  preamble.registerSignalHandlers(@This());
-  defer allCpus.deinit(allocator);
-  errdefer {
-    allCpus.restoreCpuState() catch |e| {
-      const Logger = ScopedLogger(.cpu_adjust_main);
-      Logger.log(.err, "Cpu state restoration failed with error: {!}", .{e});
-      Logger.log(.warn, "Exiting", .{});
-      std.os.linux.exit(1);
-    };
+  const Logger = ScopedLogger(.main);
+  const cliArgs = std.os.argv;
+  if (cliArgs.len == 0) {
+    Logger.log(.err, "Argument length is zero", .{});
+    Operations.printUsageAndExit();
+  } else if (cliArgs.len == 1) {
+    Logger.log(.err, "No Cli args provided", .{});
+    Operations.printUsageAndExit();
+  } else if (cliArgs.len > 3) {
+    Logger.log(.err, "Too many arguments provided", .{});
+    Operations.printUsageAndExit();
   }
 
-  var sub = try CpuPressure.Subscription.subscribe(150_000, 500_000);
-  defer CpuPressure.Subscription.close(sub);
+  const firstArg: [:0]const u8 = std.mem.sliceTo(cliArgs[1], 0);
+  const secondArg: ?[:0]const u8 = if (cliArgs.len > 2) std.mem.sliceTo(cliArgs[2], 0) else null;
 
-  while (true) {
-    const ev_count = try CpuPressure.Subscription.wait(&sub, 5_000);
-
-    if (ev_count == 0) {
-      try allCpus.adjustSleepingCpus();
-      continue;
-    }
-
-    ScopedLogger(.main_loop).log(.debug, "Cpu pressure event received", .{});
-    if (sub.revents & std.posix.POLL.ERR != 0) {
-      return error.PollError;
-    } else if (sub.revents & std.posix.POLL.PRI == 0) {
-      return error.UnknownEvent;
-    }
-
-    try allCpus.wakeOne();
+  switch (firstArg.len) {
+    4 => switch (meta.asUint(4, firstArg)) {
+      meta.arrAsUint("help") => Operations.printUsageAndExit(),
+      meta.arrAsUint("stop") => try Operations.stop(allocator, secondArg),
+      else => {},
+    },
+    5 => switch (meta.asUint(5, firstArg)) {
+      meta.arrAsUint("start") => try Operations.start(allocator, secondArg),
+      else => {},
+    },
+    6 => switch (meta.asUint(6, firstArg)) {
+      meta.arrAsUint("enable") => try Operations.enable(allocator, secondArg),
+      else => {},
+    },
+    7 => switch (meta.asUint(7, firstArg)) {
+      meta.arrAsUint("install") => try Operations.install(allocator, secondArg),
+      meta.arrAsUint("version") => printVersionAndExit(),
+      else => {},
+    },
+    9 => switch (meta.asUint(9, firstArg)) {
+      meta.arrAsUint("uninstall") => try Operations.disable(allocator, secondArg),
+      else => {},
+    },
+    else => {},
   }
+
+  Logger.log(.err, "Unknown argument: {s}", .{firstArg});
+  Operations.printUsageAndExit();
+}
+
+pub fn printVersionAndExit() noreturn {
+  const stdout = std.io.getStdOut().writer();
+  stdout.print(VERSION ++ "\n", .{}) catch {};
+  std.posix.exit(0);
 }
 
 test {
