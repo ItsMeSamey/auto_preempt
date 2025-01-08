@@ -42,7 +42,7 @@ pub fn main() !void {
   switch (firstArg.len) {
     4 => switch (meta.asUint(4, firstArg)) {
       meta.arrAsUint("help") => {
-        if (secondArg) |arg| Logger.log(.err, "Unknown argument: {s}", .{arg});
+        if (secondArg) |arg| Logger.log(.warn, "Unknown argument: {s}", .{arg});
         Operations.printUsageAndExit();
       },
       meta.arrAsUint("stop") => try Operations.stop(allocator, secondArg),
@@ -54,18 +54,20 @@ pub fn main() !void {
     },
     6 => switch (meta.asUint(6, firstArg)) {
       meta.arrAsUint("enable") => try Operations.enable(allocator, secondArg),
+      meta.arrAsUint("status") => try Operations.status(allocator, secondArg),
       else => {},
     },
     7 => switch (meta.asUint(7, firstArg)) {
-      meta.arrAsUint("install") => try Operations.install(allocator, secondArg),
       meta.arrAsUint("version") => {
-        if (secondArg) |arg| Logger.log(.err, "Unknown argument: {s}", .{arg});
+        if (secondArg) |arg| Logger.log(.warn, "Unknown argument: {s}", .{arg});
         printVersionAndExit();
       },
+      meta.arrAsUint("install") => try Operations.install(allocator, secondArg),
+      meta.arrAsUint("disable") => try Operations.disable(allocator, secondArg),
       else => {},
     },
     9 => switch (meta.asUint(9, firstArg)) {
-      meta.arrAsUint("uninstall") => try Operations.disable(allocator, secondArg),
+      meta.arrAsUint("uninstall") => try Operations.uninstall(allocator, secondArg),
       else => {},
     },
     else => {},

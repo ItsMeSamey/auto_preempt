@@ -3,7 +3,7 @@ const ScopedLogger = @import("logging.zig").ScopedLogger;
 
 pub fn ensureRoot() void {
   if (std.os.linux.geteuid() != 0) {
-    ScopedLogger(.ensure_root_user).log(.err, "This program must be run as root", .{});
+    ScopedLogger(.ensure_root_user).log(.err, "This command must be run as root", .{});
     std.posix.exit(1);
   }
 }

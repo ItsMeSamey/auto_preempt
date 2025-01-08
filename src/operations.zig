@@ -29,10 +29,8 @@ pub fn printUsageAndExit() noreturn {
     \\      auto         Automatically detect and install to /bin and if possible systemd mode
     \\      bin          Install to /usr/bin only
     \\      systemd      Install to /usr/bin + as systemd service as well
-    \\
     \\  uninstall        Stop and Uninstall this program, also remove any autostart entries
     \\  uninstall [mode] Stop and Uninstall this program, also remove any autostart entries
-    \\
     \\  start            Start this program normal mode (stay connected to terminal)
     \\                   NO need to install first
     \\  start [mode]     Start this program, program MUST be installed first
@@ -40,12 +38,14 @@ pub fn printUsageAndExit() noreturn {
     \\      auto         Automatically detact and run in daemon / systemd mode
     \\      daemon       Start in daemon mode (not associated with systemd or any other system)
     \\      systemd      Start in systemd mode, sys
-    \\
+    \\  stop             Stop this program / daemon running in background
     \\  enable [mode]    Enable this program, program must be installed first
     \\    mode:
     \\      systemd      Enable autostart using systemd
-    \\
-    \\  stop             Stop this program / daemon running in background
+    \\  disable [mode]   Disable this program, no-op if not installed / enabled
+    \\    mode:
+    \\      systemd      Disable autostart using systemd
+    \\  status           Show status of running services
     \\
     \\Source code available at <https://github.com/ItsMeSamey/auto_preempt>.
     \\Report bugs to <https://github.com/ItsMeSamey/auto_preempt/issues>.
@@ -68,77 +68,11 @@ const CpuPressure = @import("cpu_pressure.zig");
 const ScopedLogger = @import("logging.zig").ScopedLogger;
 const Operations = @import("operations.zig");
 
-
 pub var allCpus: CpuStatus.AllCpus = undefined;
 
+const NoError = error{};
 
-pub fn start(allocator: std.mem.Allocator, sub_arg: ?[:0]const u8) !void {
-  const Logger = ScopedLogger(.start);
-  preamble.ensureRoot();
-  preamble.makeOomUnkillable() catch |e| {
-    Logger.fatal("Failed to make process oom unkillable: {!}", .{e});
-  };
-
-  if (sub_arg != null) @panic("Unimplemented");
-
-  allCpus = CpuStatus.AllCpus.init(allocator) catch |e| {
-    Logger.fatal("Failed to initialize cpu status: {!}", .{e});
-  };
-
-  preamble.registerSignalHandlers(@This());
-  defer allCpus.deinit(allocator);
-  errdefer {
-    allCpus.restoreCpuState() catch |e| {
-      ScopedLogger(.cpu_adjust_main).log(.err, "Cpu state restoration failed with error: {!}", .{e});
-      ScopedLogger(.cpu_adjust_main).log(.warn, "Exiting", .{});
-      std.os.linux.exit(1);
-    };
-  }
-
-  var sub = CpuPressure.Subscription.subscribe(150_000, 500_000) catch |e| {
-    Logger.fatal("Failed to register to cpu pressure event alarm: {!}", .{e});
-  };
-
-  defer CpuPressure.Subscription.close(sub);
-  Logger.log(.info, "Started", .{});
-  while (true) {
-    const ev_count = try CpuPressure.Subscription.wait(&sub, 5_000);
-
-    if (ev_count == 0) {
-      try allCpus.adjustSleepingCpus();
-      continue;
-    }
-
-    Logger.log(.debug, "Cpu pressure event received", .{});
-    if (sub.revents & std.posix.POLL.ERR != 0) {
-      return error.PollError;
-    } else if (sub.revents & std.posix.POLL.PRI == 0) {
-      return error.UnknownEvent;
-    }
-
-    try allCpus.wakeOne();
-  }
-}
-
-pub fn stop(allocator: std.mem.Allocator, sub_arg: ?[:0]const u8) !void {
-  _ = sub_arg;
-  _ = allocator;
-  @panic("Unimplemented");
-}
-
-pub fn enable(allocator: std.mem.Allocator, sub_arg: ?[:0]const u8) !void {
-  _ = sub_arg;
-  _ = allocator;
-  @panic("Unimplemented");
-}
-
-pub fn disable(allocator: std.mem.Allocator, sub_arg: ?[:0]const u8) !void {
-  _ = sub_arg;
-  _ = allocator;
-  @panic("Unimplemented");
-}
-
-pub fn install(allocator: std.mem.Allocator, sub_arg: ?[:0]const u8) !void {
+pub fn install(allocator: std.mem.Allocator, sub_arg: ?[:0]const u8) NoError!void {
   // TODO: restart service on install
   _ = allocator; // unused
 
@@ -191,5 +125,107 @@ pub fn install(allocator: std.mem.Allocator, sub_arg: ?[:0]const u8) !void {
   }
   Logger.log(.err, "Unknown argument: {s}", .{sub_arg.?});
   Operations.printUsageAndExit();
+}
+
+pub fn uninstall(allocator: std.mem.Allocator, sub_arg: ?[:0]const u8) NoError!void {
+  _ = sub_arg;
+  _ = allocator;
+  const Logger = ScopedLogger(.uninstall);
+  preamble.ensureRoot();
+
+  Logger.fatal("Unimplemented", .{});
+}
+
+pub fn start(allocator: std.mem.Allocator, sub_arg: ?[:0]const u8) NoError!void {
+  // TODO: enable ipc checking
+  const StartLogger = ScopedLogger(.start);
+  preamble.ensureRoot();
+  preamble.makeOomUnkillable() catch |e| {
+    StartLogger.fatal("Failed to make process oom unkillable: {!}", .{e});
+  };
+
+  if (sub_arg != null) @panic("Unimplemented");
+
+  allCpus = CpuStatus.AllCpus.init(allocator) catch |e| {
+    StartLogger.fatal("Failed to initialize cpu status: {!}", .{e});
+  };
+
+  preamble.registerSignalHandlers(@This());
+  defer allCpus.deinit(allocator);
+  const Logger = struct {
+    pub const log = StartLogger.log;
+    pub fn fatal(comptime format: []const u8, args: anytype) noreturn {
+      allCpus.restoreCpuState() catch |e| {
+        ScopedLogger(.cpu_adjust_main).log(.err, "Cpu state restoration failed with error: {!}", .{e});
+        ScopedLogger(.cpu_adjust_main).log(.warn, "Exiting", .{});
+        std.os.linux.exit(1);
+      };
+      StartLogger.fatal(format, args);
+    }
+  };
+  errdefer Logger.fatal("Exiting!!", .{});
+
+  var sub = CpuPressure.Subscription.subscribe(150_000, 500_000) catch |e| {
+    Logger.fatal("Failed to register to cpu pressure event alarm: {!}", .{e});
+  };
+
+  defer CpuPressure.Subscription.close(sub);
+  Logger.log(.info, "Started", .{});
+  while (true) {
+    const ev_count = CpuPressure.Subscription.wait(&sub, 5_000) catch |e| {
+      Logger.fatal("Error occurred wait for cpu pressure event: {!}", .{e});
+    };
+
+    if (ev_count == 0) {
+      allCpus.adjustSleepingCpus() catch |e| {
+        Logger.fatal("Error occurred adjusting sleeping cpus: {!}", .{e});
+      };
+      continue;
+    }
+
+    Logger.log(.debug, "Cpu pressure event received", .{});
+    if (sub.revents & std.posix.POLL.ERR != 0) {
+      return error.PollError;
+    } else if (sub.revents & std.posix.POLL.PRI == 0) {
+      return error.UnknownEvent;
+    }
+
+    try allCpus.wakeOne();
+  }
+}
+
+pub fn stop(allocator: std.mem.Allocator, sub_arg: ?[:0]const u8) NoError!void {
+  _ = sub_arg;
+  _ = allocator;
+  const Logger = ScopedLogger(.stop);
+  preamble.ensureRoot();
+
+  Logger.fatal("Unimplemented", .{});
+}
+
+pub fn enable(allocator: std.mem.Allocator, sub_arg: ?[:0]const u8) NoError!void {
+  _ = sub_arg;
+  _ = allocator;
+  const Logger = ScopedLogger(.enable);
+  preamble.ensureRoot();
+
+  Logger.fatal("Unimplemented", .{});
+}
+
+pub fn disable(allocator: std.mem.Allocator, sub_arg: ?[:0]const u8) NoError!void {
+  _ = sub_arg;
+  _ = allocator;
+  const Logger = ScopedLogger(.disable);
+  preamble.ensureRoot();
+
+  Logger.fatal("Unimplemented", .{});
+}
+
+pub fn status(allocator: std.mem.Allocator, sub_arg: ?[:0]const u8) NoError!void {
+  _ = sub_arg;
+  _ = allocator;
+  const Logger = ScopedLogger(.status);
+
+  Logger.fatal("Unimplemented", .{});
 }
 
