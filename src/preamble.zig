@@ -15,6 +15,7 @@ pub fn makeOomUnkillable() MakeOomUnkillableError!void {
   try file.writeAll("-1000\n");
 }
 
+/// Convert a signal number to a string
 fn signalName(signal: i32) [20]u8 {
   const decls = @typeInfo(std.posix.SIG).@"struct".decls;
   inline for (decls) |decl| {
@@ -35,6 +36,8 @@ fn signalName(signal: i32) [20]u8 {
   return buf;
 }
 
+/// Register signal handlers to catch kill signals and restore the state of all the Cpu's at exit
+/// and to ignore terminal pause interrupts (Ctrl+Z)
 pub fn registerSignalHandlers(allCpuContainer: type) void {
   const handle_killaction: std.posix.Sigaction = std.posix.Sigaction{
     .handler = .{
