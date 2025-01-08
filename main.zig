@@ -35,7 +35,7 @@ pub fn main() !void {
   errdefer {
     allCpus.restoreCpuState() catch |e| {
       const Logger = ScopedLogger(.cpu_adjust_main);
-      Logger.log(.err, "Cpu state restore failed with error: {!}", .{e});
+      Logger.log(.err, "Cpu state restoration failed with error: {!}", .{e});
       Logger.log(.warn, "Exiting", .{});
       std.os.linux.exit(1);
     };
