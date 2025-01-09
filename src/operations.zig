@@ -120,9 +120,7 @@ pub fn start(allocator: std.mem.Allocator, sub_arg: ?[:0]const u8) NoError!void 
 
   if (sub_arg == null) {
     Op.auto();
-  }
-
-  switch (sub_arg.?.len) {
+  } else switch (sub_arg.?.len) {
     4 => switch (meta.arrAsUint(sub_arg.?[0..4])) {
       meta.arrAsUint("auto") => Op.auto(),
       else => {},
@@ -171,7 +169,7 @@ pub fn start(allocator: std.mem.Allocator, sub_arg: ?[:0]const u8) NoError!void 
   defer CpuPressure.Subscription.close(sub);
   Logger.log(.info, "Started", .{});
   while (true) {
-    const ev_count = CpuPressure.Subscription.wait(&sub, if (allCpus.sleepable_list.len == 0) -1 else 5_000) catch |e| {
+    const ev_count = CpuPressure.Subscription.wait(&sub, 5_000) catch |e| {
       Logger.fatal("Error occurred wait for cpu pressure event: {!}", .{e});
     };
 

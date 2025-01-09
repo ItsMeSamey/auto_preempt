@@ -9,7 +9,7 @@ fn clearFile(file: [*:0]const u8) std.fs.File.OpenError!void {
 pub const SysV = struct {
   const DaemonizeError = error {
     SetsidFailed,
-  } || std.mem.Allocator.Error || std.posix.ForkError || std.fs.File.OpenError;
+  } || std.mem.Allocator.Error || std.posix.ForkError || std.fs.File.OpenError || std.posix.ReadError || std.posix.WriteError;
   // Old style daemonize when systemd wasn't found
   pub fn daemonize() DaemonizeError!void {
     // Steps acc to: https://man7.org/linux/man-pages/man7/daemon.7.html
@@ -26,6 +26,8 @@ pub const SysV = struct {
       Logger.log(.warn, "Failed to clear /proc/self/cmdline: {!}", .{e});
     };
 
+    const pipe_pair = try std.posix.pipe();
+
     // 5. Call fork()
     const pid_1 = std.posix.fork() catch |e| {
       Logger.log(.err, "Failed to fork: {!}", .{e});
@@ -33,21 +35,26 @@ pub const SysV = struct {
     };
 
     if (pid_1 != 0) {
-      // TODO: Handle success notification
+      std.posix.close(pipe_pair[1]); // Close write end
+      var data_buf: [32]u8 = undefined;
+      const len = try std.posix.read(pipe_pair[0], &data_buf);
+      Logger.log(.warn, "{s}", .{data_buf[0..len]});
 
       // 15. Call exit() in the original process
       std.posix.exit(0); // Parent exits
     }
     // First child
+    
+    std.posix.close(pipe_pair[0]); // Close the write end of the pipe
     // 6. Call setsid() to detach from the terminal
-    // if (std.os.linux.setsid() == -1) {
-    //   Logger.log(.err, "Failed to setsid", .{});
-    //   return DaemonizeError.SetsidFailed;
-    // }
+    if (std.os.linux.setsid() == -1) {
+      _ = std.posix.write(pipe_pair[1], "FATAL: setsid failed") catch |write_err| @panic(@errorName(write_err));
+      return DaemonizeError.SetsidFailed;
+    }
 
     // 7. Call fork() again to detach from the parent process
     const pid_2 = std.posix.fork() catch |e| {
-      Logger.log(.err, "Failed to fork: {!}", .{e});
+      _ = std.posix.write(pipe_pair[1], "FATAL: Fork failed") catch |write_err| @panic(@errorName(write_err));
       return e;
     };
     // 8. Call exit() in the first child
@@ -58,8 +65,14 @@ pub const SysV = struct {
     // But we never take input, so we close stdin instead
     const null_fd = try std.posix.open("/dev/null", std.os.linux.O{ .ACCMODE = .RDWR }, 0);
     std.posix.close(std.posix.STDIN_FILENO);
-    // try std.posix.dup2(std.posix.STDOUT_FILENO, null_fd);
-    // try std.posix.dup2(std.posix.STDERR_FILENO, null_fd);
+    std.posix.dup2(std.posix.STDOUT_FILENO, null_fd) catch |e| {
+      _ = std.posix.write(pipe_pair[1], "FATAL: dup2 failed for stdout") catch |write_err| @panic(@errorName(write_err));
+      return e;
+    };
+    std.posix.dup2(std.posix.STDERR_FILENO, null_fd) catch |e| {
+      _ = std.posix.write(pipe_pair[1], "FATAL: dup2 failed for stderr") catch |write_err| @panic(@errorName(write_err));
+      return e;
+    };
     std.posix.close(null_fd);
 
     // 10. In the daemon process, reset the umask to 0
@@ -74,8 +87,9 @@ pub const SysV = struct {
     // NOT applicable
     // 13. In the daemon process, drop privileges
 
-    // TODO: implement this
     // 14. From the daemon process, notify the original process started
+    _ = std.posix.write(pipe_pair[1], "Daemon started") catch |write_err| @panic(@errorName(write_err));
+    std.posix.close(pipe_pair[1]);
   }
 };
 
