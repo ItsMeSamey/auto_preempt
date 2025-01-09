@@ -7,7 +7,7 @@ zig build-exe main.zig -OReleaseFast -fstrip -fsingle-threaded -fincremental -fl
 # Help
 
 ```txt
-Usage: auto_preempt [options] [mode]
+Usage: ./main [options] [mode]
 
 Options:
   help             Display this help message and exit.
