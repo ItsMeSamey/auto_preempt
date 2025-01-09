@@ -1,23 +1,29 @@
-fn myName(name_buf: anytype) []const u8 {
+fn myName() []const u8 {
+  const Static = struct {
+    var buf: [64]u8 = undefined;
+    var len: u8 = 0;
+  };
+  if (Static.len != 0) return Static.buf[0..Static.len];
+
   const self_name_file = std.fs.cwd().openFileZ("/proc/self/comm", .{ .mode = .read_only }) catch |e| {
     ScopedLogger(.print_usage).log(.err, "Failed to get self exe path: {!}", .{e});
     return "auto_preempt";
   };
   defer self_name_file.close();
-  var name_len = self_name_file.readAll(name_buf) catch |e| {
+  Static.len = @intCast(self_name_file.readAll(&Static.buf) catch |e| {
     ScopedLogger(.print_usage).log(.err, "Failed to read self exe name: {!}", .{e});
     return "auto_preempt";
-  };
-  if (name_buf[name_len - 1] == '\n') name_len -= 1;
-  return name_buf[0..name_len];
+  });
+  if (Static.buf[Static.len - 1] == '\n') Static.len -= 1;
+
+  return Static.buf[0..Static.len];
 }
 
 pub fn printUsageAndExit() noreturn {
   defer std.posix.exit(1);
   const stdout = std.io.getStdOut().writer();
 
-  var name_buf: [64]u8 = undefined;
-  const my_name = myName(&name_buf);
+  const my_name = myName();
 
   nosuspend stdout.print(
     \\Usage: {s} [options] args ...
@@ -77,7 +83,7 @@ const ScopedLogger = @import("logging.zig").ScopedLogger;
 
 pub var allCpus: CpuStatus.AllCpus = undefined;
 
-const NoError = error{};
+const NoError = error{NoError};
 
 pub fn start(allocator: std.mem.Allocator, sub_arg: ?[:0]const u8) NoError!void {
   // TODO: enable ipc checking
@@ -92,8 +98,7 @@ pub fn start(allocator: std.mem.Allocator, sub_arg: ?[:0]const u8) NoError!void 
     }
 
     pub fn auto() void {
-      var name_buf: [64]u8 = undefined;
-      const my_name = myName(&name_buf);
+      const my_name = myName();
       StartLogger.log(.info, "If you wanted to start connected to terminal, start with `{s} start normal`", .{ my_name });
       if (
         setup.isInitSystem("systemd") catch |e| StartLogger.fatal("Error detecting init system: {!}", .{e}) and
@@ -166,7 +171,7 @@ pub fn start(allocator: std.mem.Allocator, sub_arg: ?[:0]const u8) NoError!void 
   defer CpuPressure.Subscription.close(sub);
   Logger.log(.info, "Started", .{});
   while (true) {
-    const ev_count = CpuPressure.Subscription.wait(&sub, 5_000) catch |e| {
+    const ev_count = CpuPressure.Subscription.wait(&sub, if (allCpus.sleepable_list.len == 0) -1 else 5_000) catch |e| {
       Logger.fatal("Error occurred wait for cpu pressure event: {!}", .{e});
     };
 
@@ -317,8 +322,7 @@ pub fn enable(allocator: std.mem.Allocator, sub_arg: ?[:0]const u8) NoError!void
       setup.Systemd.enable() catch |e| {
         Logger.fatal("Failed to uninstall systemd service: {!}", .{e});
       };
-      var name_buf: [64]u8 = undefined;
-      const my_name = myName(&name_buf);
+      const my_name = myName();
       // TODO: handle already running
       Logger.log(.info, "To enable service, run `{s} enable{s}{s}`", .{my_name, if (sub == null) "" else " ", sub orelse ""});
     }
@@ -365,8 +369,7 @@ pub fn disable(allocator: std.mem.Allocator, sub_arg: ?[:0]const u8) NoError!voi
       };
 
       // TODO: Add context, Handle not running / running
-      var name_buf: [64]u8 = undefined;
-      const my_name = myName(&name_buf);
+      const my_name = myName();
       Logger.log(.info, "To remove service, run `{s} uninstall systemd`", .{ my_name });
     }
 
