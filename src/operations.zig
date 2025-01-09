@@ -92,9 +92,12 @@ pub fn start(allocator: std.mem.Allocator, sub_arg: ?[:0]const u8) NoError!void 
 
   const Op = struct {
     pub fn systemd() void {
+      StartLogger.log(.info, "Starting systemd service", .{});
       setup.Systemd.start() catch |e| {
         StartLogger.fatal("Failed to start systemd service: {!}", .{e});
       };
+      StartLogger.log(.info, "Successfully started systemd service", .{});
+      std.posix.exit(0);
     }
 
     pub fn auto() void {

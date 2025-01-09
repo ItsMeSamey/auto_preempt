@@ -51,26 +51,29 @@ pub fn installBin() InstallBinError!InstallBinResult {
       return InstallBinError.BadExitStatus;
     }
 
-    blk: {
+    const is_older: bool = blk: {
       if (result.stdout.len < VERSION.len + 1) {
         Logger.log(.verbose, "Output of auto_preempt version command shorter, therefore version must be older", .{});
-        break :blk; // +1 for newline
+        break :blk true; // +1 for newline
       }
       for (0..VERSION.len) |idx| {
         switch (std.math.order(result.stdout[idx], VERSION[idx])) {
           .eq => continue,
-          .lt => break :blk,
+          .lt => break :blk true,
           .gt => {
             Logger.log(.warn, "Newer version of auto_preempt is already installed", .{});
             return .newerExists;
           },
         }
       }
-      Logger.log(.warn, "Same version of auto_preempt is already installed", .{});
-      return .sameExists;
-    }
+      break :blk false;
+    };
 
-    Logger.log(.warn, "An older installation was found, updating", .{});
+    if (is_older) {
+      Logger.log(.warn, "An older installation was found, updating", .{});
+    } else {
+      Logger.log(.warn, "Same version of auto_preempt is installed, overriding", .{});
+    }
     std.fs.deleteFileAbsoluteZ(bin_dest) catch |e| {
       Logger.log(.err, "Failed to delete old binary: {s}", .{@errorName(e)});
       return e;
@@ -158,10 +161,13 @@ pub const Systemd = struct {
     \\
     \\[Service]
     \\Type=simple
-    ++ "ExecStart=" ++ bin_dest ++ " start normal\n" ++
+    ++ "\nExecStart=" ++ bin_dest ++ " start normal\n" ++
     \\Restart=always
     \\RestartSec=5
     \\TimeoutSec=5
+    \\
+    \\StandardOutput=journal
+    \\StandardError=journal
     \\
     \\[Install]
     \\WantedBy=multi-user.target
