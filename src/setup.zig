@@ -29,15 +29,21 @@ pub fn installBin() InstallBinError!InstallBinResult {
   const Logger = ScopedLogger(.install_bin);
 
   Logger.log(.info, "Installing binary as " ++ bin_dest, .{});
-  if (try checkExists(bin_dest)) {
-    var buf: [1 << 8]u8 = undefined;
+  if (checkExists(bin_dest) catch |e| {
+    Logger.log(.err, "Failed to check if binary exists: {s}", .{@errorName(e)});
+    return e;
+  }) {
+    var buf: [1 << 10]u8 = undefined;
     var buf_allocator = std.heap.FixedBufferAllocator.init(&buf);
     const allocator = buf_allocator.allocator();
-    const result = try std.process.Child.run(.{
+    const result = std.process.Child.run(.{
       .allocator = allocator,
-      .argv = &[_][]const u8{"", "version"},
+      .argv = &[_][]const u8{bin_dest, "version"},
       .max_output_bytes = 16,
-    });
+    }) catch |e| {
+      Logger.log(.err, "Failed to run auto_preempt version command: {s}", .{@errorName(e)});
+      return e;
+    };
     if (result.term.Exited != 0) {
       Logger.log(.err, "Failed to get version of auto_preempt, process exited with status {d}", .{result.term.Exited});
       Logger.log(.info, "Process Stdout: {s}", .{ result.stdout });
@@ -46,7 +52,10 @@ pub fn installBin() InstallBinError!InstallBinResult {
     }
 
     blk: {
-      if (result.stdout.len < VERSION.len + 1) break :blk; // +1 for newline
+      if (result.stdout.len < VERSION.len + 1) {
+        Logger.log(.verbose, "Output of auto_preempt version command shorter, therefore version must be older", .{});
+        break :blk; // +1 for newline
+      }
       for (0..VERSION.len) |idx| {
         switch (std.math.order(result.stdout[idx], VERSION[idx])) {
           .eq => continue,
@@ -56,13 +65,16 @@ pub fn installBin() InstallBinError!InstallBinResult {
             return .newerExists;
           },
         }
-        Logger.log(.warn, "Same version of auto_preempt is already installed", .{});
-        return .sameExists;
       }
+      Logger.log(.warn, "Same version of auto_preempt is already installed", .{});
+      return .sameExists;
     }
 
     Logger.log(.warn, "An older installation was found, updating", .{});
-    try std.fs.deleteFileAbsoluteZ(bin_dest);
+    std.fs.deleteFileAbsoluteZ(bin_dest) catch |e| {
+      Logger.log(.err, "Failed to delete old binary: {s}", .{@errorName(e)});
+      return e;
+    };
     std.fs.copyFileAbsolute("/proc/self/exe", bin_dest, .{}) catch |e| {
       Logger.log(.err, "Old file was deleted but could not install new one !!", .{});
       return e;
@@ -72,7 +84,10 @@ pub fn installBin() InstallBinError!InstallBinResult {
   }
 
   Logger.log(.info, "No previous installation found, installing", .{});
-  try std.fs.copyFileAbsolute("/proc/self/exe", bin_dest, .{});
+  std.fs.copyFileAbsolute("/proc/self/exe", bin_dest, .{}) catch |e| {
+    Logger.log(.err, "Failed to install binary: {s}", .{@errorName(e)});
+    return e;
+  };
   Logger.log(.info, "Successfully installed", .{});
   return .installed;
 }
@@ -122,7 +137,7 @@ fn exec(comptime argv: []const []const u8) ExecError!void {
   inline for (1..argv.len) |idx| command = command ++ " " ++ argv[idx];
   ScopedLogger(.exec).log(.debug, "Executing command: {s}", .{command});
 
-  var buf: [1 << 8]u8 = undefined;
+  var buf: [1 << 10]u8 = undefined;
   var buf_allocator = std.heap.FixedBufferAllocator.init(&buf);
   const allocator = buf_allocator.allocator();
   var child = std.process.Child.init(argv, allocator);
@@ -143,7 +158,7 @@ pub const Systemd = struct {
     \\
     \\[Service]
     \\Type=simple
-    ++ "ExecStart=" ++ bin_dest ++ " start" ++ "\n" ++
+    ++ "ExecStart=" ++ bin_dest ++ " start normal\n" ++
     \\Restart=always
     \\RestartSec=5
     \\TimeoutSec=5
@@ -159,7 +174,7 @@ pub const Systemd = struct {
     Logger.log(.info, "Installing systemd service", .{});
     var file = try std.fs.cwd().createFileZ(systemd_service_dest, .{
       .read = true,
-      .exclusive = true,
+      .exclusive = false,
       .mode = 0o755,
     });
     defer file.close();

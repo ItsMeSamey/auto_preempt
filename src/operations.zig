@@ -223,6 +223,7 @@ pub fn install(allocator: std.mem.Allocator, sub_arg: ?[:0]const u8) NoError!voi
     pub fn auto() void {
       _ = bin();
       if (setup.isInitSystem("systemd") catch |e| Logger.fatal("Error detecting init system: {!}", .{e})) {
+        Logger.log(.warn, "Systemd detected, installing systemd service as well", .{});
         systemd();
       }
     }
@@ -236,15 +237,16 @@ pub fn install(allocator: std.mem.Allocator, sub_arg: ?[:0]const u8) NoError!voi
     3 => switch (meta.arrAsUint(sub_arg.?[0..3])) {
       meta.arrAsUint("bin") => {
         _ = Op.bin();
+        return;
       },
       else => {},
     },
     4 => switch (meta.arrAsUint(sub_arg.?[0..4])) {
-      meta.arrAsUint("auto") => Op.auto(),
+      meta.arrAsUint("auto") => return Op.auto(),
       else => {},
     },
     7 => switch (meta.arrAsUint(sub_arg.?[0..7])) {
-      meta.arrAsUint("systemd") => Op.systemd(),
+      meta.arrAsUint("systemd") => return Op.systemd(),
       else => {},
     },
     else => {},
@@ -262,45 +264,33 @@ pub fn uninstall(allocator: std.mem.Allocator, sub_arg: ?[:0]const u8) NoError!v
 
   const Op = struct {
     pub fn systemd() void {
-      setup.Systemd.uninstall() catch |e| {
-        Logger.fatal("Failed to uninstall systemd service: {!}", .{e});
-      };
+      if (setup.Systemd.check() catch |e| Logger.fatal("Error detecting if systemd service is present: {!}", .{e})) {
+        setup.Systemd.uninstall() catch |e| {
+          Logger.fatal("Failed to uninstall systemd service: {!}", .{e});
+        };
+      } else {
+        Logger.log(.warn, "Systemd service not present no-op", .{});
+      }
     }
 
     pub fn bin() void {
-      return setup.uninstallBin() catch |e| {
+      setup.uninstallBin() catch |e| {
         Logger.fatal("Failed to install binary: {!}", .{e});
       };
-    }
-
-    pub fn auto() void {
-      bin();
-      if (
-        setup.isInitSystem("systemd") catch |e| Logger.fatal("Error detecting init system: {!}", .{e}) and
-        setup.Systemd.check() catch |e| Logger.fatal("Error detecting if systemd service is present: {!}", .{e})
-      ) {
-        systemd();
-      }
+      systemd();
     }
   };
 
   if (sub_arg == null) {
-    return Op.auto();
+    return Op.bin();
   }
-
   switch (sub_arg.?.len) {
     3 => switch (meta.arrAsUint(sub_arg.?[0..3])) {
-      meta.arrAsUint("bin") => {
-        _ = Op.bin();
-      },
-      else => {},
-    },
-    4 => switch (meta.arrAsUint(sub_arg.?[0..4])) {
-      meta.arrAsUint("auto") => Op.auto(),
+      meta.arrAsUint("bin") => return Op.bin(),
       else => {},
     },
     7 => switch (meta.arrAsUint(sub_arg.?[0..7])) {
-      meta.arrAsUint("systemd") => Op.systemd(),
+      meta.arrAsUint("systemd") => return Op.systemd(),
       else => {},
     },
     else => {},
@@ -340,11 +330,11 @@ pub fn enable(allocator: std.mem.Allocator, sub_arg: ?[:0]const u8) NoError!void
 
   switch (sub_arg.?.len) {
     4 => switch (meta.arrAsUint(sub_arg.?[0..4])) {
-      meta.arrAsUint("auto") => Op.auto(sub_arg),
+      meta.arrAsUint("auto") => return Op.auto(sub_arg),
       else => {},
     },
     7 => switch (meta.arrAsUint(sub_arg.?[0..7])) {
-      meta.arrAsUint("systemd") => Op.systemd(sub_arg),
+      meta.arrAsUint("systemd") => return Op.systemd(sub_arg),
       else => {},
     },
     else => {},
@@ -386,11 +376,11 @@ pub fn disable(allocator: std.mem.Allocator, sub_arg: ?[:0]const u8) NoError!voi
 
   switch (sub_arg.?.len) {
     4 => switch (meta.arrAsUint(sub_arg.?[0..4])) {
-      meta.arrAsUint("auto") => Op.auto(sub_arg),
+      meta.arrAsUint("auto") => return Op.auto(sub_arg),
       else => {},
     },
     7 => switch (meta.arrAsUint(sub_arg.?[0..7])) {
-      meta.arrAsUint("systemd") => Op.systemd(sub_arg),
+      meta.arrAsUint("systemd") => return Op.systemd(sub_arg),
       else => {},
     },
     else => {},
