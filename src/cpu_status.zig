@@ -73,6 +73,9 @@ pub const Cpu = struct {
   pub fn setOnlineUnchecked(self: *@This(), online: bool) SetOnlineError!void {
     var online_file = try std.fs.cwd().openFileZ(@ptrCast(&self.online_file_name.?), .{.mode = .write_only});
     defer online_file.close();
+    const prev_state = self.online_now;
+    self.online_now = online;
+    errdefer self.online_now = prev_state;
     if (online) {
       try online_file.writeAll(&[_]u8{'1'});
     } else {
@@ -112,8 +115,8 @@ pub const Cpu = struct {
     }
   }
 
-  pub fn cpuName(self: *@This()) []const u8 {
-    if (self.online_file_name) |file_name| {
+  pub fn cpuName(self: *const @This()) []const u8 {
+    if (self.online_file_name) |*file_name| {
       return file_name[0..std.mem.indexOfScalar(u8, file_name[0..], '/') orelse unreachable];
     } else {
       return UNKNOWN;
@@ -257,8 +260,11 @@ pub const AllCpus = struct {
     Logger.log(.info, "Restoring cpu state", .{});
     for (self.cpu_list) |*entry| {
       if (entry.online_file_name == null) continue;
+      if (entry.online_now == entry.initital_state) {
+        Logger.log(.debug, "State of {s} is already {s}", .{@as([*:0]const u8, @ptrCast(&entry.online_file_name.?)), if (entry.initital_state) "online" else "offline"});
+        continue;
+      }
       Logger.log(.debug, "Restoring state of {s} to {s}", .{@as([*:0]const u8, @ptrCast(&entry.online_file_name.?)), if (entry.initital_state) "online" else "offline"});
-      if (entry.online_now == entry.initital_state) continue;
       entry.setOnlineUnchecked(entry.initital_state) catch |e| {
         ScopedLogger(.cpu_list).log(
           .err,

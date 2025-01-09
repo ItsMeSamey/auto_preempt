@@ -26,6 +26,14 @@ pub fn printUsageAndExit() noreturn {
     \\  help             Display this help message and exit.
     \\  version          Output version information and exit.
     \\
+    \\  start            Start this program normal mode (stay connected to terminal)
+    \\                   NO need to install first
+    \\  start [mode]     Start this program, program MUST be installed first
+    \\    mode:
+    \\      auto         Automatically detact and run in daemon / systemd mode
+    \\      daemon       Start in daemon mode (not associated with systemd or any other system)
+    \\      systemd      Start in systemd mode, sys
+    \\  stop             Stop this program / daemon running in background
     \\  install          Install this program in auto mode
     \\  install [mode]   Install this program
     \\    mode:
@@ -38,14 +46,6 @@ pub fn printUsageAndExit() noreturn {
     \\      auto         Automatically remove from /bin and if possible systemd service
     \\      bin          Remove from /usr/bin
     \\      systemd      Remove systemd service
-    \\  start            Start this program normal mode (stay connected to terminal)
-    \\                   NO need to install first
-    \\  start [mode]     Start this program, program MUST be installed first
-    \\    mode:
-    \\      auto         Automatically detact and run in daemon / systemd mode
-    \\      daemon       Start in daemon mode (not associated with systemd or any other system)
-    \\      systemd      Start in systemd mode, sys
-    \\  stop             Stop this program / daemon running in background
     \\  enable [mode]    Enable this program, program must be installed first
     \\    mode:
     \\      systemd      Enable autostart using systemd
@@ -70,6 +70,7 @@ const meta = @import("meta.zig");
 const setup = @import("setup.zig");
 const builtin = @import("builtin");
 const preamble = @import("preamble.zig");
+const daemonize = @import("daemonize.zig");
 const CpuStatus = @import("cpu_status.zig");
 const CpuPressure = @import("cpu_pressure.zig");
 const ScopedLogger = @import("logging.zig").ScopedLogger;
@@ -77,6 +78,124 @@ const ScopedLogger = @import("logging.zig").ScopedLogger;
 pub var allCpus: CpuStatus.AllCpus = undefined;
 
 const NoError = error{};
+
+pub fn start(allocator: std.mem.Allocator, sub_arg: ?[:0]const u8) NoError!void {
+  // TODO: enable ipc checking
+  const StartLogger = ScopedLogger(.start);
+  preamble.ensureRoot();
+
+  const Op = struct {
+    pub fn systemd() void {
+      setup.Systemd.start() catch |e| {
+        StartLogger.fatal("Failed to start systemd service: {!}", .{e});
+      };
+    }
+
+    pub fn auto() void {
+      var name_buf: [64]u8 = undefined;
+      const my_name = myName(&name_buf);
+      StartLogger.log(.info, "If you wanted to start connected to terminal, start with `{s} start normal`", .{ my_name });
+      if (
+        setup.isInitSystem("systemd") catch |e| StartLogger.fatal("Error detecting init system: {!}", .{e}) and
+        setup.Systemd.check() catch |e| StartLogger.fatal("Error detecting if systemd service is present: {!}", .{e})
+      ) {
+        systemd();
+      } else {
+        StartLogger.log(.warn, "No service installed, stating in legacy (daemon) mode instead", .{});
+        daemon();
+      }
+    }
+
+    pub fn daemon() void {
+      daemonize.SysV.daemonize() catch |e| {
+        StartLogger.fatal("Failed to start daemon: {!}", .{e});
+      };
+    }
+  };
+
+  if (sub_arg == null) {
+    Op.auto();
+  }
+
+  switch (sub_arg.?.len) {
+    4 => switch (meta.arrAsUint(sub_arg.?[0..4])) {
+      meta.arrAsUint("auto") => Op.auto(),
+      else => {},
+    },
+    6 => switch (meta.arrAsUint(sub_arg.?[0..6])) {
+      meta.arrAsUint("daemon") => Op.daemon(),
+      meta.arrAsUint("normal") => {
+        StartLogger.log(.info, "Starting connected to terminal", .{});
+      },
+      else => {},
+    },
+    7 => switch (meta.arrAsUint(sub_arg.?[0..7])) {
+      meta.arrAsUint("systemd") => Op.systemd(),
+      else => {},
+    },
+    else => {},
+  }
+
+  preamble.makeOomUnkillable() catch |e| {
+    StartLogger.fatal("Failed to make process oom unkillable: {!}", .{e});
+  };
+
+  allCpus = CpuStatus.AllCpus.init(allocator) catch |e| {
+    StartLogger.fatal("Failed to initialize cpu status: {!}", .{e});
+  };
+  preamble.registerSignalHandlers(@This());
+  defer allCpus.deinit(allocator);
+
+  const Logger = struct {
+    pub const log = StartLogger.log;
+    pub fn fatal(comptime format: []const u8, args: anytype) noreturn {
+      allCpus.restoreCpuState() catch |e| {
+        ScopedLogger(.cpu_adjust_main).log(.err, "Cpu state restoration failed with error: {!}", .{e});
+        ScopedLogger(.cpu_adjust_main).log(.warn, "Exiting", .{});
+        std.os.linux.exit(1);
+      };
+      StartLogger.fatal(format, args);
+    }
+  };
+  errdefer Logger.fatal("Exiting!!", .{});
+
+  var sub = CpuPressure.Subscription.subscribe(150_000, 500_000) catch |e| {
+    Logger.fatal("Failed to register to cpu pressure event alarm: {!}", .{e});
+  };
+
+  defer CpuPressure.Subscription.close(sub);
+  Logger.log(.info, "Started", .{});
+  while (true) {
+    const ev_count = CpuPressure.Subscription.wait(&sub, 5_000) catch |e| {
+      Logger.fatal("Error occurred wait for cpu pressure event: {!}", .{e});
+    };
+
+    if (ev_count == 0) {
+      allCpus.adjustSleepingCpus() catch |e| {
+        Logger.fatal("Error occurred adjusting sleeping cpus: {!}", .{e});
+      };
+      continue;
+    }
+
+    Logger.log(.debug, "Cpu pressure event received", .{});
+    if (sub.revents & std.posix.POLL.ERR != 0) {
+      return error.PollError;
+    } else if (sub.revents & std.posix.POLL.PRI == 0) {
+      return error.UnknownEvent;
+    }
+
+    try allCpus.wakeOne();
+  }
+}
+
+pub fn stop(allocator: std.mem.Allocator, sub_arg: ?[:0]const u8) NoError!void {
+  _ = sub_arg;
+  _ = allocator;
+  const Logger = ScopedLogger(.stop);
+  preamble.ensureRoot();
+
+  Logger.fatal("Unimplemented", .{});
+}
 
 pub fn install(allocator: std.mem.Allocator, sub_arg: ?[:0]const u8) NoError!void {
   // TODO: restart service on install
@@ -185,73 +304,6 @@ pub fn uninstall(allocator: std.mem.Allocator, sub_arg: ?[:0]const u8) NoError!v
   }
   Logger.log(.err, "Unknown argument: {s}", .{sub_arg.?});
   printUsageAndExit();
-}
-
-pub fn start(allocator: std.mem.Allocator, sub_arg: ?[:0]const u8) NoError!void {
-  // TODO: enable ipc checking
-  const StartLogger = ScopedLogger(.start);
-  preamble.ensureRoot();
-  preamble.makeOomUnkillable() catch |e| {
-    StartLogger.fatal("Failed to make process oom unkillable: {!}", .{e});
-  };
-
-  if (sub_arg != null) @panic("Unimplemented");
-
-  allCpus = CpuStatus.AllCpus.init(allocator) catch |e| {
-    StartLogger.fatal("Failed to initialize cpu status: {!}", .{e});
-  };
-
-  preamble.registerSignalHandlers(@This());
-  defer allCpus.deinit(allocator);
-  const Logger = struct {
-    pub const log = StartLogger.log;
-    pub fn fatal(comptime format: []const u8, args: anytype) noreturn {
-      allCpus.restoreCpuState() catch |e| {
-        ScopedLogger(.cpu_adjust_main).log(.err, "Cpu state restoration failed with error: {!}", .{e});
-        ScopedLogger(.cpu_adjust_main).log(.warn, "Exiting", .{});
-        std.os.linux.exit(1);
-      };
-      StartLogger.fatal(format, args);
-    }
-  };
-  errdefer Logger.fatal("Exiting!!", .{});
-
-  var sub = CpuPressure.Subscription.subscribe(150_000, 500_000) catch |e| {
-    Logger.fatal("Failed to register to cpu pressure event alarm: {!}", .{e});
-  };
-
-  defer CpuPressure.Subscription.close(sub);
-  Logger.log(.info, "Started", .{});
-  while (true) {
-    const ev_count = CpuPressure.Subscription.wait(&sub, 5_000) catch |e| {
-      Logger.fatal("Error occurred wait for cpu pressure event: {!}", .{e});
-    };
-
-    if (ev_count == 0) {
-      allCpus.adjustSleepingCpus() catch |e| {
-        Logger.fatal("Error occurred adjusting sleeping cpus: {!}", .{e});
-      };
-      continue;
-    }
-
-    Logger.log(.debug, "Cpu pressure event received", .{});
-    if (sub.revents & std.posix.POLL.ERR != 0) {
-      return error.PollError;
-    } else if (sub.revents & std.posix.POLL.PRI == 0) {
-      return error.UnknownEvent;
-    }
-
-    try allCpus.wakeOne();
-  }
-}
-
-pub fn stop(allocator: std.mem.Allocator, sub_arg: ?[:0]const u8) NoError!void {
-  _ = sub_arg;
-  _ = allocator;
-  const Logger = ScopedLogger(.stop);
-  preamble.ensureRoot();
-
-  Logger.fatal("Unimplemented", .{});
 }
 
 pub fn enable(allocator: std.mem.Allocator, sub_arg: ?[:0]const u8) NoError!void {
