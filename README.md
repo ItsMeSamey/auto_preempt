@@ -41,7 +41,5 @@ Options:
     mode:
       auto         Automatically detect and disable. If not installed / already disabled, no-op
       systemd      Disable autostart using systemd
-  status           Show status of running services
-
 ```
 

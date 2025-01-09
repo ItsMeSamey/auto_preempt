@@ -61,7 +61,7 @@ pub fn printUsageAndExit() noreturn {
     \\    mode:
     \\      auto         Automatically detect and disable. If not installed / already disabled, no-op
     \\      systemd      Disable autostart using systemd
-    \\  status           Show status of running services
+    // \\  status           Show status of running services
     \\
     \\Source code available at <https://github.com/ItsMeSamey/auto_preempt>.
     \\Report bugs to <https://github.com/ItsMeSamey/auto_preempt/issues>.
