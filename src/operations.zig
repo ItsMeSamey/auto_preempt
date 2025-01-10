@@ -28,6 +28,9 @@ pub fn printUsageAndExit() noreturn {
   nosuspend stdout.print(
     \\Usage: {s} [options] [mode]
     \\
+    \\A service to automatically offline un-needed cpu cores
+    \\NOTE: This is just a personal project
+    \\
     \\Options:
     \\  help             Display this help message and exit.
     \\  version          Output version information and exit.
