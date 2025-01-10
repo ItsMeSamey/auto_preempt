@@ -1,7 +1,7 @@
-# Compilation
-
 > [!WARNING]
 > [Offlining cpu cores may ?NOT save power](https://www.reddit.com/r/linuxquestions/comments/112t4x2/will_disabling_some_cpu_cores_save_power/)
+
+# Compilation
 
 ```bash
 zig build-exe main.zig -OReleaseFast -fstrip -fsingle-threaded -fincremental -flto -mno-red-zone
