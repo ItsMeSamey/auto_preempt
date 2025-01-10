@@ -32,6 +32,8 @@ pub fn printUsageAndExit() noreturn {
     \\  help             Display this help message and exit.
     \\  version          Output version information and exit.
     \\
+    \\  status           Show status of running services
+    \\
     \\  start            Start this program normal mode (stay connected to terminal)
     \\                   NO need to install first
     \\  start [mode]     Start this program, program MUST be installed first
@@ -39,7 +41,8 @@ pub fn printUsageAndExit() noreturn {
     \\      auto         Automatically detact and run in daemon / systemd mode
     \\      daemon       Start in daemon mode (not associated with systemd or any other system)
     \\      systemd      Start in systemd mode, sys
-    // \\  stop             Stop this program / daemon running in background
+    \\  stop             Stop this program / daemon running in background
+    \\
     \\  install          Install this program in auto mode
     \\  install [mode]   Install this program
     \\    mode:
@@ -51,17 +54,18 @@ pub fn printUsageAndExit() noreturn {
     \\    mode:
     \\      bin          Remove from /usr/bin + remove all services (does not stop running services)
     \\      systemd      Remove systemd service
+    \\
     \\  enable           Enable in auto mode
     \\  enable [mode]    Enable this program, program must be installed first
     \\    mode:
     \\      auto         Automatically detect and enable. If not installed / already enable, no-op
     \\      systemd      Enable autostart using systemd
-    \\  disable         Disable in auto mode
+    \\  disable          Disable in auto mode
     \\  disable [mode]   Disable this program, no-op if not installed / enabled
     \\    mode:
     \\      auto         Automatically detect and disable. If not installed / already disabled, no-op
     \\      systemd      Disable autostart using systemd
-    // \\  status           Show status of running services
+    \\
     \\
     \\Source code available at <https://github.com/ItsMeSamey/auto_preempt>.
     \\Report bugs to <https://github.com/ItsMeSamey/auto_preempt/issues>.
@@ -75,6 +79,7 @@ pub fn printUsageAndExit() noreturn {
 }
 
 const std = @import("std");
+const ipc = @import("ipc.zig");
 const meta = @import("meta.zig");
 const setup = @import("setup.zig");
 const builtin = @import("builtin");
@@ -92,6 +97,10 @@ pub fn start(allocator: std.mem.Allocator, sub_arg: ?[:0]const u8) NoError!void 
   // TODO: enable ipc checking
   const StartLogger = ScopedLogger(.start);
   preamble.ensureRoot();
+
+  if (ipc.checkProcessExistence() catch |e| StartLogger.fatal("Error detecting if process already exists: {!}", .{e})) {
+    StartLogger.fatal("Process already exists", .{});
+  }
 
   const Op = struct {
     pub fn systemd() void {
@@ -149,7 +158,14 @@ pub fn start(allocator: std.mem.Allocator, sub_arg: ?[:0]const u8) NoError!void 
     StartLogger.fatal("Failed to make process oom unkillable: {!}", .{e});
   };
 
+  switch (ipc.createPidFile() catch |e| StartLogger.fatal("Failed to create pid file: {!}", .{e})) {
+    .exists => StartLogger.fatal("Pid file already exists", .{}),
+    .created => {},
+  }
+  defer ipc.removePidFile() catch |e| StartLogger.log(.err, "Failed to remove pid file: {!}", .{e});
+
   allCpus = CpuStatus.AllCpus.init(allocator) catch |e| {
+    ipc.removePidFile() catch |e_1| StartLogger.log(.err, "Failed to remove pid file: {!}", .{e_1});
     StartLogger.fatal("Failed to initialize cpu status: {!}", .{e});
   };
   preamble.registerSignalHandlers(@This());
@@ -158,10 +174,9 @@ pub fn start(allocator: std.mem.Allocator, sub_arg: ?[:0]const u8) NoError!void 
   const Logger = struct {
     pub const log = StartLogger.log;
     pub fn fatal(comptime format: []const u8, args: anytype) noreturn {
+      ipc.removePidFile() catch |e| StartLogger.log(.err, "Failed to remove pid file: {!}", .{e});
       allCpus.restoreCpuState() catch |e| {
         ScopedLogger(.cpu_adjust_main).log(.err, "Cpu state restoration failed with error: {!}", .{e});
-        ScopedLogger(.cpu_adjust_main).log(.warn, "Exiting", .{});
-        std.os.linux.exit(1);
       };
       StartLogger.fatal(format, args);
     }
@@ -198,12 +213,28 @@ pub fn start(allocator: std.mem.Allocator, sub_arg: ?[:0]const u8) NoError!void 
 }
 
 pub fn stop(allocator: std.mem.Allocator, sub_arg: ?[:0]const u8) NoError!void {
-  _ = sub_arg;
-  _ = allocator;
+  _ = allocator; // unused
   const Logger = ScopedLogger(.stop);
   preamble.ensureRoot();
 
-  Logger.fatal("Unimplemented", .{});
+  if (sub_arg) |sub| {
+    Logger.log(.err, "Unrecognized argument: {s}", .{sub});
+    printUsageAndExit();
+  }
+
+  if (setup.Systemd.check() catch |e| blk: {
+    Logger.log(.err, "Failed to check if systemd service exists: {!}", .{e});
+    break :blk false;
+  }) {
+    Logger.log(.info, "Trying to stop systemd service", .{});
+    setup.Systemd.stop() catch |e| switch (e) {
+      setup.ExecError.BadExitStatus => Logger.log(.warn, "systemctl exited with bad exit status", .{}),
+      else => Logger.log(.err, "Failed to stop systemd service: {!}", .{e}),
+    };
+  }
+
+  ipc.killExistingProcess() catch |e| Logger.fatal("Failed to kill existing process: {s}", .{@errorName(e)});
+  Logger.log(.info, "Success", .{});
 }
 
 pub fn install(allocator: std.mem.Allocator, sub_arg: ?[:0]const u8) NoError!void {
@@ -396,10 +427,18 @@ pub fn disable(allocator: std.mem.Allocator, sub_arg: ?[:0]const u8) NoError!voi
 }
 
 pub fn status(allocator: std.mem.Allocator, sub_arg: ?[:0]const u8) NoError!void {
-  _ = sub_arg;
   _ = allocator;
   const Logger = ScopedLogger(.status);
 
-  Logger.fatal("Unimplemented", .{});
+  if (sub_arg) |sub| {
+    Logger.log(.err, "Unrecognized argument: {s}", .{sub});
+    printUsageAndExit();
+  }
+
+  if (ipc.getExistingProcessId() catch |e| Logger.fatal("Failed to get existing process id: {!}", .{e})) |pid| {
+    Logger.log(.info, "Running in background with pid {d}", .{pid});
+  } else {
+    Logger.log(.info, "No running process detected", .{});
+  }
 }
 

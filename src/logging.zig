@@ -47,7 +47,8 @@ pub fn ScopedLogger(comptime scope: @TypeOf(.enum_literal)) type {
 
 pub const global_logging_level: LoggingLevelEnum = switch (builtin.mode) {
   .Debug => .debug,
-  .ReleaseSafe => .info,
-  .ReleaseFast, .ReleaseSmall => .warn,
+  else => .info,
 };
+
+// pub const global_logging_level: LoggingLevelEnum = .verbose;
 

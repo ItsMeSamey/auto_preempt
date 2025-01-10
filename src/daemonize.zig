@@ -93,29 +93,3 @@ pub const SysV = struct {
   }
 };
 
-// const Systemd = struct {
-//   const systemd = @cImport({
-//     @cInclude("systemd/sd-daemon.h");
-//   });
-//
-//   // if notify fails, it's between user and systemd, i dint do noting wrong
-//
-//   pub fn notifyStart() void {
-//     _ = systemd.sd_notify(0, "READY=1");
-//   }
-//
-//   pub fn notifyStop() void {
-//     _ = systemd.sd_notify(0, "STOPPING=1");
-//   }
-//
-//   pub fn notifyStatus(comptime status: anytype) void {
-//     _ = systemd.sd_notify(0, "STATUS=" ++ status);
-//   }
-//
-//   pub fn systemdDaemonize() !void {
-//     // Steps acc to: https://man7.org/linux/man-pages/man7/daemon.7.html
-//
-//   }
-// };
-
-

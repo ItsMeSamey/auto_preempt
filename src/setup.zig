@@ -132,7 +132,7 @@ pub fn isInitSystem(comptime name: []const u8) GetInitNameError!bool {
   return meta.asUint(name.len, name) == meta.asUint(name.len, result);
 }
 
-const ExecError = error{
+pub const ExecError = error{
   BadExitStatus
 } || std.process.Child.SpawnError;
 fn exec(comptime argv: []const []const u8) ExecError!void {
@@ -161,7 +161,7 @@ pub const Systemd = struct {
     \\
     \\[Service]
     \\Type=simple
-    ++ "\nExecStart=" ++ bin_dest ++ " start normal\n" ++
+    ++ "\nExecStart=" ++ bin_dest ++ "stop&&" ++ bin_dest ++ " start normal\n" ++
     \\Restart=always
     \\RestartSec=5
     \\TimeoutSec=5
