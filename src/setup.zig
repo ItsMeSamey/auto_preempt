@@ -161,7 +161,7 @@ pub const Systemd = struct {
     \\
     \\[Service]
     \\Type=simple
-    ++ "\nExecStart=" ++ bin_dest ++ "stop&&" ++ bin_dest ++ " start normal\n" ++
+    ++ "\nExecStart=" ++ bin_dest ++ " start normal\n" ++
     \\Restart=always
     \\RestartSec=5
     \\TimeoutSec=5

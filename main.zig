@@ -1,9 +1,6 @@
 // Build Cmd: zig build-exe main.zig -OReleaseFast -fstrip -fsingle-threaded -fincremental -flto -mno-red-zone
 // TODOS's:
-//    cli args
 //    config file and options
-//    support for daemonizing
-//    ipc to ensure only one instance is running
 //    documentation
 //    better handling for terminal pause interrupts
 //    more todo's ;)
