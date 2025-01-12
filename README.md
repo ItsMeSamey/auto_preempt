@@ -42,11 +42,12 @@ Options:
 
   status           Show status of running services
 
-  start            Start this program normal mode (stay connected to terminal)
-                   NO need to install first
+  start            Star in auto mode
   start [mode]     Start this program, program MUST be installed first
     mode:
       auto         Automatically detact and run in daemon / systemd mode
+      normal       Start this program normal mode (stay connected to terminal)
+                   NO need to install first
       daemon       Start in daemon mode (not associated with systemd or any other system)
       systemd      Start in systemd mode, sys
   stop             Stop this program / daemon running in background

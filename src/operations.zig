@@ -37,11 +37,12 @@ pub fn printUsageAndExit() noreturn {
     \\
     \\  status           Show status of running services
     \\
-    \\  start            Start this program normal mode (stay connected to terminal)
-    \\                   NO need to install first
+    \\  start            Start in auto mode 
     \\  start [mode]     Start this program, program MUST be installed first
     \\    mode:
     \\      auto         Automatically detact and run in daemon / systemd mode
+    \\      normal       Start this program normal mode (stay connected to terminal)
+    \\                   NO need to install first
     \\      daemon       Start in daemon mode (not associated with systemd or any other system)
     \\      systemd      Start in systemd mode, sys
     \\  stop             Stop this program / daemon running in background
@@ -171,6 +172,11 @@ pub fn start(allocator: std.mem.Allocator, sub_arg: ?[:0]const u8) NoError!void 
     ipc.removePidFile() catch |e_1| StartLogger.log(.err, "Failed to remove pid file: {!}", .{e_1});
     StartLogger.fatal("Failed to initialize cpu status: {!}", .{e});
   };
+  if (allCpus.sleeping_list.len == 0 and allCpus.sleepable_list.len == 0) {
+    StartLogger.log(.warn, "No cpus that can be onlined/offlined, stopping!", .{});
+    ipc.removePidFile() catch |e| StartLogger.log(.err, "Failed to remove pid file: {!}", .{e});
+    std.posix.exit(0);
+  }
   preamble.registerSignalHandlers(@This());
   defer allCpus.deinit(allocator);
 
